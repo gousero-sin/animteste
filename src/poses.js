@@ -1,0 +1,76 @@
+// Biblioteca de poses (referencial do corpo: x para frente, y para baixo, âncora no chão).
+// hF/hB: mãos relativas ao ombro. fF/fB: pés relativos à âncora. hip: quadril relativo à âncora.
+'use strict';
+
+const POSES = {
+  stand: { hip: [0, -88], ln: 3, hd: 0, hF: [8, 62], hB: [-4, 62], fF: [12, 0], fB: [-12, 0] },
+
+  // ---------- lutador de gelo (kung fu) ----------
+  kfReady: { hip: [-6, -76], ln: 6, hd: 0, hF: [50, -4], hB: [22, 14], fF: [40, 0], fB: [-36, 0] },
+  kfLow: { hip: [-10, -62], ln: 14, hd: -6, hF: [56, -10], hB: [16, 28], fF: [48, 0], fB: [-46, 0] },
+  kfHorse: { hip: [0, -64], ln: 2, hd: 0, hF: [60, -4], hB: [54, 12], fF: [46, 0], fB: [-46, 0] },
+  kfCrane: { hip: [0, -88], ln: -4, hd: -4, hF: [38, -58], hB: [-50, -22], fF: [16, -42], fB: [-4, 0] },
+  kfWind: { hip: [-12, -74], ln: -8, hd: 2, hF: [-16, 26], hB: [32, 4], fF: [40, 0], fB: [-38, 0] },
+  palm: { hip: [14, -70], ln: 16, hd: 0, hF: [70, -6], hB: [-28, 34], fF: [58, 0], fB: [-42, 0] },
+  palm2: { hip: [10, -66], ln: 10, hd: 0, hF: [64, -14], hB: [64, 12], fF: [50, 0], fB: [-44, 0] },
+  palmUp: { hip: [6, -78], ln: -6, hd: -8, hF: [40, -66], hB: [-30, 30], fF: [40, 0], fB: [-34, 0] },
+  slamGround: { hip: [-10, -42], ln: 62, hd: 10, hF: [26, 62], hB: [8, 66], fF: [34, 0], fB: [-36, 0] },
+  crouch: { hip: [0, -52], ln: 26, hd: 0, hF: [40, 28], hB: [14, 48], fF: [30, 0], fB: [-28, 0] },
+  land: { hip: [0, -56], ln: 22, hd: 0, hF: [50, 18], hB: [-34, 30], fF: [32, 0], fB: [-30, 0] },
+  tuck: { hip: [0, -88], ln: 16, hd: 6, hF: [34, 14], hB: [18, 26], fF: [26, -44], fB: [-4, -36] },
+  kick: { hip: [-10, -86], ln: -22, hd: 6, hF: [24, 8], hB: [-42, 18], fF: [78, -86], fB: [-12, 0] },
+  kickChamber: { hip: [-4, -88], ln: -6, hd: 0, hF: [30, 10], hB: [-30, 20], fF: [30, -50], fB: [-10, 0] },
+  sideKick: { hip: [-14, -84], ln: -40, hd: 18, hF: [10, 30], hB: [-40, -6], fF: [92, -66], fB: [-14, 0] },
+  airKick: { hip: [0, -88], ln: -18, hd: 4, hF: [20, -10], hB: [-40, 10], fF: [74, -20], fB: [-6, -40] },
+  diveKick: { hip: [0, -88], ln: -30, hd: 14, hF: [-10, -50], hB: [-50, -10], fF: [60, 10], fB: [-20, -40] },
+  run1: { hip: [6, -82], ln: 22, hd: -4, hF: [-26, 36], hB: [36, 10], fF: [44, -14], fB: [-40, -26] },
+  run2: { hip: [6, -84], ln: 22, hd: -4, hF: [36, 10], hB: [-26, 36], fF: [-34, -30], fB: [40, -10] },
+  dash: { hip: [10, -70], ln: 38, hd: -12, hF: [-46, 30], hB: [-58, 20], fF: [44, -6], fB: [-50, -8] },
+  swordReady: { hip: [-6, -74], ln: 6, hd: 0, hF: [34, 16], hB: [-30, -30], fF: [40, 0], fB: [-36, 0], swa: -50 },
+  swBlock: { hip: [-8, -76], ln: 2, hd: 0, hF: [50, -6], hB: [-34, -26], fF: [38, 0], fB: [-38, 0], swa: -94 },
+  swThrust: { hip: [14, -68], ln: 18, hd: 0, hF: [68, -10], hB: [-42, -24], fF: [62, 0], fB: [-46, 0], swa: -3 },
+  swHigh: { hip: [-4, -84], ln: -8, hd: -4, hF: [12, -66], hB: [-30, 20], fF: [34, 0], fB: [-36, 0], swa: -150 },
+  swChop: { hip: [12, -64], ln: 26, hd: 0, hF: [60, 14], hB: [-36, 24], fF: [58, 0], fB: [-46, 0], swa: 26 },
+  swSlash: { hip: [8, -72], ln: 12, hd: 0, hF: [64, -14], hB: [-40, -10], fF: [50, 0], fB: [-44, 0], swa: -8 },
+  swLean: { hip: [-18, -80], ln: -42, hd: -18, hF: [26, -10], hB: [-30, 30], fF: [34, 0], fB: [-40, 0], swa: -70 },
+  swLock: { hip: [4, -70], ln: 18, hd: -4, hF: [48, -26], hB: [40, -14], fF: [52, 0], fB: [-50, 0], swa: -40 },
+
+  palmB: { hip: [14, -70], ln: 16, hd: 0, hF: [-22, 34], hB: [72, -8], fF: [58, 0], fB: [-42, 0] },
+  palmLow: { hip: [6, -58], ln: 30, hd: -10, hF: [62, 26], hB: [58, 40], fF: [50, 0], fB: [-44, 0] },
+  roll: { hip: [0, -88], ln: 30, hd: 14, hF: [24, 30], hB: [10, 38], fF: [28, -50], fB: [4, -40] },
+
+  clap: { hip: [-4, -72], ln: 6, hd: 0, hF: [54, -16], hB: [52, -12], fF: [44, 0], fB: [-44, 0] },
+  salute: { hip: [0, -88], ln: 2, hd: 4, hF: [28, 2], hB: [26, 6], fF: [10, 0], fB: [-10, 0] },
+  guardX: { hip: [-4, -70], ln: -4, hd: 6, hF: [34, -30], hB: [30, -12], fF: [44, 0], fB: [-44, 0] },
+
+  // ---------- reações ----------
+  hit: { hip: [-10, -82], ln: -28, hd: -16, hF: [36, -26], hB: [16, -34], fF: [22, 0], fB: [-26, 0] },
+  hitFwd: { hip: [6, -80], ln: 34, hd: 18, hF: [10, 40], hB: [-10, 46], fF: [24, 0], fB: [-24, 0] },
+  flyBack: { hip: [0, -88], ln: -30, hd: -20, hF: [44, -46], hB: [26, -56], fF: [36, -22], fB: [14, -42] },
+  lie: { hip: [0, -16], ln: -88, hd: -6, hF: [36, -20], hB: [-24, 4], fF: [70, -10], fB: [50, -26] },
+  kneel: { hip: [-4, -46], ln: 18, hd: 6, hF: [40, 50], hB: [16, 54], fF: [30, 0], fB: [-36, 0] },
+
+  // ---------- lança da tempestade ----------
+  spGuard: { hip: [-4, -76], ln: 10, hd: 0, hF: [30, 26], hB: [-30, 40], fF: [32, 0], fB: [-34, 0], spear: 1, sa: -12, sg: 100, sb: 30 },
+  spLow: { hip: [-8, -62], ln: 22, hd: -10, hF: [36, 34], fF: [44, 0], fB: [-46, 0], spear: 1, sa: -6, sg: 100, sb: 30 },
+  spThrust: { hip: [14, -66], ln: 28, hd: -6, hF: [66, 4], fF: [62, 0], fB: [-50, 0], spear: 1, sa: -3, sg: 70, sb: 10 },
+  spDraw: { hip: [-12, -74], ln: 0, hd: 0, hF: [-6, 30], fF: [36, 0], fB: [-40, 0], spear: 1, sa: -4, sg: 100, sb: 40 },
+  spOver: { hip: [-4, -86], ln: -12, hd: -4, hF: [10, -62], fF: [30, 0], fB: [-34, 0], spear: 1, sa: -160, sg: 80, sb: 20 },
+  spSlam: { hip: [10, -62], ln: 36, hd: 0, hF: [56, 12], fF: [50, 0], fB: [-50, 0], spear: 1, sa: 26, sg: 90, sb: 30 },
+  spTwirl: { hip: [-2, -84], ln: 2, hd: 0, hF: [30, -20], hB: [-34, 20], fF: [26, 0], fB: [-28, 0], spear: 1, sa: 0, sg: 105, sb: -1 },
+  spSky: { hip: [0, -88], ln: -6, hd: -22, hF: [6, -72], hB: [-36, 14], fF: [24, 0], fB: [-26, 0], spear: 1, sa: -88, sg: 60, sb: -1 },
+  spThrowWind: { hip: [-12, -80], ln: -16, hd: 0, hF: [-52, -40], hB: [52, -14], fF: [42, 0], fB: [-42, 0], spear: 1, sa: -8, sg: 105, sb: -1 },
+  spThrow: { hip: [20, -74], ln: 26, hd: 0, hF: [64, -24], hB: [-40, 30], fF: [56, 0], fB: [-36, -4], spear: 1, sa: -2, sg: 105, sb: -1 },
+  spBlockHi: { hip: [-6, -80], ln: -4, hd: -6, hF: [36, -40], fF: [30, 0], fB: [-34, 0], spear: 1, sa: 178, sg: 150, sb: 70 },
+  spSweep: { hip: [0, -48], ln: 30, hd: -6, hF: [56, 36], fF: [40, 0], fB: [-56, 0], spear: 1, sa: 4, sg: 100, sb: 40 },
+  spVault: { hip: [0, -88], ln: 30, hd: 0, hF: [30, 30], hB: [20, 40], fF: [-20, -30], fB: [-40, -20], spear: 1, sa: 80, sg: 160, sb: 110 },
+  spRun1: { hip: [6, -80], ln: 24, hd: -6, hF: [34, 30], fF: [44, -14], fB: [-40, -26], spear: 1, sa: 4, sg: 110, sb: 50 },
+  spRun2: { hip: [6, -82], ln: 24, hd: -6, hF: [34, 26], fF: [-34, -30], fB: [40, -10], spear: 1, sa: 2, sg: 110, sb: 50 },
+  spPoint: { hip: [2, -76], ln: 12, hd: -4, hF: [56, -14], hB: [-30, 30], fF: [44, 0], fB: [-40, 0], spear: 1, sa: -4, sg: 60, sb: -1 },
+  spBlockMid: { hip: [-6, -76], ln: 0, hd: 0, hF: [40, -24], fF: [32, 0], fB: [-36, 0], spear: 1, sa: -84, sg: 120, sb: 40 },
+  spThrustUp: { hip: [4, -54], ln: 22, hd: -12, hF: [52, -24], fF: [46, 0], fB: [-46, 0], spear: 1, sa: -36, sg: 70, sb: 10 },
+  spKick: { hip: [-10, -86], ln: -18, hd: 4, hF: [8, 16], hB: [-34, 14], fF: [84, -64], fB: [-10, 0], spear: 1, sa: -84, sg: 100, sb: -1 },
+  spLock: { hip: [4, -70], ln: 18, hd: -4, hF: [48, -22], fF: [52, 0], fB: [-50, 0], spear: 1, sa: -36, sg: 90, sb: 30 },
+  spRoar: { hip: [-2, -82], ln: -14, hd: -30, hF: [40, -40], hB: [-50, -30], fF: [40, 0], fB: [-40, 0], spear: 1, sa: -60, sg: 80, sb: -1 },
+  spDive: { hip: [0, -88], ln: 50, hd: 20, hF: [40, 40], fF: [-30, -20], fB: [-50, -40], spear: 1, sa: 70, sg: 90, sb: 30 },
+};

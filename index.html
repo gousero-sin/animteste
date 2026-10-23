@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gelo vs Tempestade</title>
+<style>
+  :root { --bg: #0b0b0d; --fg: #e8e8ea; --muted: #8a8a92; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font-family: Inter, system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px 16px; box-sizing: border-box; min-height: 100vh; }
+  #cv { height: min(78vh, 160vw); max-width: 100%; aspect-ratio: 9 / 16; background: #000; display: block; }
+  .bar { display: flex; gap: 10px; align-items: center; width: min(520px, 100%); }
+  .bar input[type=range] { flex: 1; }
+  button { background: #222; color: var(--fg); border: 1px solid #333; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  #tc { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 64px; text-align: right; }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1080" height="1920"></canvas>
+<div class="bar" id="ui">
+  <button id="play">▶</button>
+  <input id="seek" type="range" min="0" max="1799" value="0">
+  <span id="tc">0.00s</span>
+</div>
+<script src="src/engine.js"></script>
+<script src="src/render.js"></script>
+<script src="src/fx.js"></script>
+<script src="src/poses.js"></script>
+<script src="src/choreo.js"></script>
+<script src="src/audio.js"></script>
+<script src="src/debug.js"></script>
+<script>
+  const cv = document.getElementById('cv');
+  cv.width = CFG.W; cv.height = CFG.H;
+  if (CFG.W > CFG.H) cv.style.aspectRatio = '16 / 9';
+  const ctx = cv.getContext('2d');
+  buildScene();
+  const total = Math.round(CFG.DURATION * CFG.FPS);
+  window.drawFrame = f => renderFrame(ctx, f);
+  window.frameData = f => { renderFrame(ctx, f); return cv.toDataURL('image/png'); };
+  const seek = document.getElementById('seek'), tc = document.getElementById('tc'), btn = document.getElementById('play');
+  seek.max = total - 1;
+  let playing = false, f0 = 0, t0 = 0;
+  function show(f) { renderFrame(ctx, f); seek.value = f; tc.textContent = (f / CFG.FPS).toFixed(2) + 's'; }
+  function loop(ts) {
+    if (!playing) return;
+    const f = f0 + Math.floor((ts - t0) / 1000 * CFG.FPS);
+    if (f >= total) { playing = false; btn.textContent = '▶'; show(total - 1); return; }
+    show(f);
+    requestAnimationFrame(loop);
+  }
+  btn.onclick = () => {
+    playing = !playing; btn.textContent = playing ? '❚❚' : '▶';
+    if (playing) { f0 = +seek.value >= total - 1 ? 0 : +seek.value; t0 = performance.now(); requestAnimationFrame(loop); }
+  };
+  seek.oninput = () => { playing = false; btn.textContent = '▶'; show(+seek.value); };
+  if (new URLSearchParams(location.search).has('render')) document.getElementById('ui').style.display = 'none';
+  else show(0);
+</script>
+</body>
+</html>

@@ -1691,9 +1691,9 @@ def sfx_boom(B):
     t = tvec(n)
     out = np.zeros((n, 2))
     r = rng(1000)
-    k = ns(0.006)
-    cr = r.standard_normal((k, 2)) * np.exp(-np.arange(k) / (k / 4))[:, None]
-    out[:k] += cr * 1.4
+    k = ns(0.008)
+    cr = butter(r.standard_normal(k), 'low', 9000, 2) * np.exp(-np.arange(k) / (k / 4))
+    put(out, cr * 1.2, 0.0)
     m = ns(0.06)
     snap = butter(r.standard_normal(m), 'band', [1000, 3500], 2)
     snap = snap / np.abs(snap).max() * np.exp(-tvec(m) / 0.009)
@@ -2860,7 +2860,8 @@ def build(report=True):
             seg = y[i0:i1]
             k = np.arange(i1 - i0)
             w = np.minimum(smooth01(k / ns(0.005)), smooth01((i1 - i0 - k) / ns(0.35)))[:, None]
-            y[i0:i1] = seg * (1 - w) + c * np.tanh(seg / c) * w
+            cl = butter(c * np.tanh(seg / c), 'low', 15000.0, 4, zero_phase=True)   # no HF edges -> no AAC overshoot
+            y[i0:i1] = seg * (1 - w) + cl * w
         return y
     for it in range(4):
         lim, gs = tp_limit(boom_clip(mix * g), -1.5)

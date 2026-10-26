@@ -73,13 +73,16 @@ def render_frames(frames, only, outdir, scale=1.0, quality=95):
 
 
 def _full_worker(args):
-    start, end, only, outdir, stride, offset = args
+    """Render one chunk of frames. Each chunk runs in a fresh process (maxtasksperchild=1)
+    so per-process memory growth (GL objects, module caches) stays bounded."""
+    frames, only, outdir = args
     os.environ.setdefault('LP_NUM_THREADS', '2')
+    todo = [i for i in frames if not os.path.exists(os.path.join(outdir, f'{i:04d}.jpg'))]
+    if not todo:
+        return 0
     comp = Compositor(load_effects(only))
-    for i in range(start + offset, end, stride):
+    for i in todo:
         p = os.path.join(outdir, f'{i:04d}.jpg')
-        if os.path.exists(p):
-            continue
         try:
             img, S = comp.render(i)
         except Exception:
@@ -88,8 +91,8 @@ def _full_worker(args):
         cv2.imwrite(p + '.tmp.jpg', img[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 97,
                     cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444])
         os.rename(p + '.tmp.jpg', p)
-        if i % 50 == 0:
-            print(f'[w{offset}] {i}', flush=True)
+    print(f'[chunk {frames[0]}-{frames[-1]}] done', flush=True)
+    return len(todo)
 
 
 def main():
@@ -128,9 +131,12 @@ def main():
         from multiprocessing import Pool
         outdir = os.path.join(C.OUT, 'frames')
         os.makedirs(outdir, exist_ok=True)
-        jobs = [(a.start, a.end, a.only, outdir, a.procs, k) for k in range(a.procs)]
-        with Pool(a.procs) as pool:
-            pool.map(_full_worker, jobs)
+        chunk = 48
+        frames = list(range(a.start, a.end))
+        jobs = [(frames[k:k + chunk], a.only, outdir) for k in range(0, len(frames), chunk)]
+        with Pool(a.procs, maxtasksperchild=1) as pool:
+            for _ in pool.imap_unordered(_full_worker, jobs):
+                pass
 
 
 if __name__ == '__main__':

@@ -59,7 +59,7 @@ SUCK0, SUCK1 = 49.45, 50.55          # yank (main stretch) window
 HIDE0, HIDE1 = 50.55, 53.57          # person invisible
 ARR0, ARR1 = 53.58, 54.25            # emergence
 ARR_OPEN = 53.50                      # arrival portal spring start (just after the exit flash peak)
-IRIS0, IRIS1 = 50.86, 51.20           # tunnel iris opens under the collapse flash
+IRIS0, IRIS1 = 50.85, 51.15           # tunnel iris opens under the collapse flash
 PUSH0, PUSH1 = 50.70, 51.24           # camera push into the ceiling
 COL0, COL1 = EV['ceil_portal_close']  # 50.55, 51.10
 TUN0, TUN1 = EV['tunnel']             # 51.00, 53.55
@@ -150,7 +150,7 @@ def ceil_state(t):
     st['core'] = core_
     st['haze'] = 1.6 * sstep(44.7, 45.8, t) * (1 - 0.6 * sstep(46.0, 46.8, t)) + 0.5 * sstep(45.95, 47.0, t) + 0.5 * sstep(49.2, 50.0, t)
     st['haze'] *= 1 - sstep(50.6, 50.9, t)
-    st['rays'] = (0.13 * sstep(46.3, 47.5, t) + 0.05 * sstep(48.4, 49.4, t) + 0.08 * sstep(49.3, 49.9, t)
+    st['rays'] = (0.17 * sstep(46.3, 47.5, t) + 0.05 * sstep(48.4, 49.4, t) + 0.08 * sstep(49.3, 49.9, t)
                   + 0.06 * np.exp(-((t - 49.45) / 0.12) ** 2)) * (1 - sstep(50.45, 50.8, t))
     st['light'] = (1.1 * sstep(45.9, 46.9, t) + 0.25 * sstep(48.4, 49.3, t) + 0.7 * sstep(49.3, 49.9, t)) * (1 - sstep(50.5, 50.75, t)) \
         + 1.2 * np.exp(-((t - 46.0) / 0.1) ** 2) + 0.15 * sstep(45.0, 45.9, t) * (1 - sstep(45.9, 46.1, t)) \
@@ -204,7 +204,7 @@ def suck_params(t):
         return 'ceil', s, ant, pre
     if ARR0 - 0.02 <= t < 54.6:
         tau = lin(ARR0, ARR1, t)
-        s = (1 - tau)
+        s = (1 - tau) ** 1.6              # fast out of the portal, decelerating into place
         ant = 0.0
         if t > ARR1 - 0.04:
             x = t - (ARR1 - 0.04)
@@ -369,7 +369,8 @@ class FX(core.Effect):
 
     def person(self, S):
         # runs before suit's person(): suit detects the warped person and transfers itself through
-        # S.meta['person_warp'] (centre warp maps), so the suit + its emissive seams stretch with him
+        # S.meta['person_warp'] (centre-sample maps, -100 where the body is gone), so the suit and
+        # its emissive seams stretch with him and vanish where he dissolves
         self._warp_person(S)
 
     def lights(self, S):
@@ -866,7 +867,7 @@ class FX(core.Effect):
         x0, y0 = path(tau[idx])
         x1, y1 = path(taup[idx])
         fade = np.sin(np.pi * np.clip(tau[idx], 0, 1)) ** 0.7
-        b = bb[idx] * fade * 0.22 * gate * (bb[idx] > (0.75 if mode == 'ceil' else 0.82))
+        b = bb[idx] * fade * (0.22 if mode == 'ceil' else 0.14) * gate * (bb[idx] > (0.75 if mode == 'ceil' else 0.85))
         hue = self.f_hue[idx]
         col = np.stack([0.30 + 0.55 * hue, 0.62 + 0.3 * (1 - hue), np.full_like(hue, 1.45)], 1) * 1.3
         rgba = np.concatenate([col * b[:, None], b[:, None]], 1).astype(np.float32)
@@ -903,7 +904,7 @@ class FX(core.Effect):
         if not alive.any():
             return None
         near = np.clip(Z0 / Za, 0.5, 4.0)
-        b = self.b_b * (1 - u) ** 1.6 * 3.2 * alive * vsm(0.5, 1.2, pa[:, 2])
+        b = self.b_b * (1 - u) ** 1.6 * 4.2 * alive * vsm(0.5, 1.2, pa[:, 2])
         hot = np.array([1.6, 1.55, 2.0])
         mid = np.array([0.80, 0.45, 1.65])
         cool = np.array([0.38, 0.18, 0.95])
@@ -911,7 +912,7 @@ class FX(core.Effect):
         k2 = vsm(0.3, 1.0, u)[:, None]
         col = (hot * (1 - k1) + mid * k1) * (1 - k2) + cool * k2
         rgba = np.concatenate([col * b[:, None], b[:, None]], 1).astype(np.float32)
-        rad = (0.45 + 0.55 * self.b_w) * near
+        rad = (0.6 + 0.75 * self.b_w) * near
         sel = alive & (b > 0.01)
         p0 = np.stack([xa, ya], 1)[sel]
         p1 = np.stack([xb, yb], 1)[sel]
@@ -1009,7 +1010,7 @@ class FX(core.Effect):
         foc = 540.0
         bend = 0.32
         if t > 52.95:
-            ex = 0.012 * np.exp((t - 52.95) / 0.115)
+            ex = 0.012 * np.exp((t - 52.95) / 0.13)
         else:
             ex = 0.0
         q = 2
@@ -1142,7 +1143,7 @@ class FX(core.Effect):
                 # rounds out into a full-frame circle as it engulfs the camera
                 cen = np.array(self._tunnel_cam(t)[0])
                 asp = CEIL['ry'] / CEIL['rx0'] + (1 - CEIL['ry'] / CEIL['rx0']) * e ** 0.8
-                R = 18 + 1550 * e ** 1.5
+                R = 30 + 1500 * e ** 1.1
                 X, Y = core.grid()
                 rr = np.sqrt((X - cen[0]) ** 2 + ((Y - cen[1]) / asp) ** 2)
                 soft = 6.0 + 50.0 * e
@@ -1345,7 +1346,14 @@ class FX(core.Effect):
         cov = ac * (1.0 - smoothstep(Dc * 0.35, Dc, dpc)) * sstep(0.05, 0.25, s)
         cov = cv2.GaussianBlur(cov, (0, 0), 2.0) * 0.95
         smn = np.clip(sm / (sm.max() + 1e-4), 0, 1)
-        ecol = mixc * (0.35 + 0.9 * band[..., None] + 0.5 * smn[..., None]) + np.float32([0.6, 0.65, 0.9]) * (hot ** 2)[..., None]
+        band2 = (0.5 + 0.5 * np.cos(5.0 * ph - dpc / 17.0 + 41.0 * S.t * dirn)) ** 6
+        band3 = (0.5 + 0.5 * np.cos(9.0 * ph + dpc / 29.0 - 33.0 * S.t * dirn)) ** 8
+        ab = cv2.GaussianBlur(ac, (0, 0), 7.0)
+        fres = np.clip((1.0 - ab) * 2.2, 0, 1) * ac                # bright limb (fresnel)
+        ecol = mixc * (0.22 + 0.75 * band[..., None] + 0.45 * band2[..., None] + 0.3 * band3[..., None]
+                       + 0.35 * smn[..., None])
+        ecol += np.float32([0.55, 0.70, 1.15]) * fres[..., None] * 0.9
+        ecol += np.float32([0.6, 0.65, 0.9]) * (hot ** 2)[..., None]
         layers = []
         if cov.max() > 0.01:
             layers.append(Layer('over', (ecol * cov[..., None]).astype(np.float32), cov.astype(np.float32), box=(x0, y0)))
@@ -1356,8 +1364,8 @@ class FX(core.Effect):
         t = S.t
         # flashes: collapse (bridges into the tunnel) and tunnel exit (into space); they radiate
         # from their source and only white out the whole frame at the peak
-        f1 = sstep(50.78, 50.855, t) * (1 - sstep(50.86, 50.96, t)) ** 2.0
-        f2 = sstep(53.34, 53.47, t) ** 2 * (1 - sstep(53.48, 53.62, t)) ** 1.5
+        f1 = sstep(50.78, 50.855, t) * (1 - sstep(50.86, 50.935, t)) ** 2.0
+        f2 = sstep(53.385, 53.46, t) ** 2 * (1 - sstep(53.47, 53.56, t)) ** 1.5
         for f, cen, tint in ((f1, (CEIL['px'], CEIL['yc']), (0.85, 0.85, 1.0)),
                              (f2, tuple(self._tunnel_cam(min(t, TUN1))[0]), (0.95, 0.97, 1.0))):
             if f <= 0.002:
@@ -1371,8 +1379,3 @@ class FX(core.Effect):
             g = (3.2 * f * prof)[..., None]
             img = img * (1 - 0.75 * f * prof[..., None]) + np.asarray(tint, np.float32) * g
         return img
-
-
-def core_pose(i):
-    from .. import assets as A
-    return A.pose(int(np.clip(i, 0, C.N_FRAMES - 1)))

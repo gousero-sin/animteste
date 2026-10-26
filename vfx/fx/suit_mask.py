@@ -64,6 +64,20 @@ def _ss(a, b, x):
     return x * x * (3 - 2 * x)
 
 
+_QG = {}
+
+
+def _qgrid(wq, hq, x0, y0):
+    """Full-frame pixel coordinates of the half-res raster cells (cached per size)."""
+    k = (wq, hq)
+    if k not in _QG:
+        ys, xs = np.mgrid[0:hq, 0:wq].astype(np.float32)
+        _QG.clear()
+        _QG[k] = (xs * Q + Q * 0.5, ys * Q + Q * 0.5)
+    X, Y = _QG[k]
+    return X + x0, Y + y0
+
+
 def _hand_hull(dst, p, rf, x0, y0, val=1.0):
     """Palm hull + finger capsules for 21 landmarks p (21,2)."""
     palm = cv2.convexHull(p[list(PALM_IDX)].astype(np.float32)).reshape(-1, 2)
@@ -144,17 +158,16 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
     if len(ff['skull']) >= 3:
         cv2.fillPoly(skull, [_pts(ff['skull'], x0, y0)], 1.0, cv2.LINE_AA, SH)
     if fg is not None:
+        # dark hair / beard by texture: the local MINIMUM of the brightness (dark hairs over
+        # skin) - the beard is not darker than the neck on average, but always contains very
+        # dark pixels.  Computed on the RAW foreground (independent of other modules' grades).
         v = cv2.resize(fg.max(-1), (wq, hq), interpolation=cv2.INTER_AREA)
-        v = cv2.GaussianBlur(v, (0, 0), 1.5)
-        hair = _ss(0.16, 0.06, v)
-        hair = cv2.dilate(hair, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        # beard darkness relative to his own skin (exposure / grade independent): reference =
-        # the body skin just under the face (always lit skin, also in back / profile views)
-        m = (face_core > 0.5) & (aq > 0.9) & (hair < 0.5)
-        ref = float(np.percentile(v[m], 60)) if m.sum() > 50 else 0.25
-        ref = float(np.clip(ref, 0.05, 0.6))
-        beard = _ss(0.55 * ref, 0.30 * ref, v)
-        beard_d = cv2.dilate(beard, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        vmin = cv2.erode(v, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        dk = _ss(0.045, 0.018, vmin)
+        dk = _ss(0.25, 0.5, cv2.GaussianBlur(dk, (0, 0), 2.5))
+        hair = dk
+        beard = dk
+        beard_d = cv2.dilate(beard, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     else:
         hair = np.zeros_like(face_hull)
         beard = np.zeros_like(face_hull)
@@ -169,7 +182,14 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
     # face hull: everything when the mesh is reliable; when synthesised (profile / back view)
     # it is often far off, so it then claims only the beard (the skull covers above the ears).
     # pose-jaw hull: beard only (the pose drags it onto raised forearms / the neck).
-    head = np.maximum.reduce([face_hull * (conf + (1 - conf) * beard_d), ears, skull, jaw * beard_d])
+    # reliability of the (possibly synthesised) face oval.  Only the true back-of-head view
+    # makes it garbage: there the inner face region is mostly hair.
+    mcore = (face_core > 0.5) & (aq > 0.5)
+    dfrac = float(beard[mcore].mean()) if mcore.sum() > 30 else 0.0
+    fw_ = max(conf, float(geo.frontal[i]), float(np.clip((7.0 - geo.face_dist[i]) / 4.0, 0, 1)),
+              float(np.clip((0.52 - dfrac) / 0.07, 0, 1)))
+    fw_ = fw_ * fw_ * (3 - 2 * fw_)
+    head = np.maximum.reduce([face_hull * (fw_ + (1 - fw_) * beard_d), ears, skull, jaw * beard_d])
     core = face_core * conf
 
     # ---------------------------------------------------------------- hands
@@ -187,8 +207,12 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
             # shutter sweep: hull at t-1/2 .. t+1/2 frame along the landmark velocity
             vn = float(np.linalg.norm(vel[0]))
             nsub = 1 if vn < 2.0 else (3 if vn < 25 else 5)
-            for o in np.linspace(-0.5, 0.5, nsub) if nsub > 1 else (0.0,):
-                _hand_hull(hb, p + vel * o, rf, x0, y0)
+            offs = np.linspace(-0.5, 0.5, nsub) if nsub > 1 else np.zeros(1)
+            for o in sorted(offs, key=lambda o: -abs(o)):
+                # the blur trail fades toward the ends of the shutter interval
+                hs_ = np.zeros_like(hands)
+                _hand_hull(hs_, p + vel * o, rf, x0, y0)
+                np.maximum(hb, hs_ * (1.0 - 0.9 * abs(o)), out=hb)
             hc = np.zeros_like(hands)
             _hand_hull(hc, p, rf, x0, y0)
             # flat cuff cut across the wrist (sleeve ends in a straight line, not a round cap)
@@ -199,6 +223,15 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
             c0 = p[0] + fdir * (0.25 * rf)
             c1 = p[0] - fdir * (0.05 * sw)
             _quad(hb, [c0 + nrm * r_wr, c1 + nrm * r_wr, c1 - nrm * r_wr, c0 - nrm * r_wr], x0, y0)
+            # motion-blurred fingers outside the hull: semi-transparent matte near the hand, on
+            # the hand side of the cuff line, is hand (decontaminated colour = blurred skin)
+            if alpha is not None:
+                kr = max(3, int(0.12 * sw / Q)) | 1
+                near = cv2.dilate(hb, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kr, kr)))
+                Xq, Yq = _qgrid(wq, hq, x0, y0)
+                side_ = ((Xq - c1[0]) * fdir[0] + (Yq - c1[1]) * fdir[1]) > 0
+                blur_ = _ss(0.93, 0.80, aq) * _ss(0.02, 0.08, aq)
+                np.maximum(hb, near * blur_ * side_, out=hb)
             np.maximum(hands, hb * wl, out=hands)
             np.maximum(hand_core, hc * wl, out=hand_core)
             hand_info[side] = dict(p=p, wr=p[0].copy(), fdir=fdir, r_wr=r_wr, w=wl, cuff=c1)

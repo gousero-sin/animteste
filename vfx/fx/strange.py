@@ -56,6 +56,7 @@ T_REL = 73.82                          # wipe release (after the breath-in TW0..
 T_FRONT1 = 74.15                       # reality front reaches the rim
 T_STIR0, T_STIR1 = 72.85, 74.12        # his circling hand stirs the big ring
 CF = np.array([460.0, 930.0])          # final portal centre (behind his head, slightly frame-left)
+FC0 = np.array([485.0, 1140.0])        # where the reality front starts: his casting hands (73.8 s)
 R_SMALL0, R_SMALL1, R_OPEN = 44.0, 80.0, 370.0
 GRAV = 1900.0                          # px/s^2
 SHUTTER = 0.030                        # streak length in seconds of motion
@@ -96,10 +97,20 @@ def _gather(t):
     return np.where(t < T_REL, g, np.exp(-np.maximum(t - T_REL, 0.0) / 0.035))
 
 
+def _front_C(t):
+    """Centre of the reality front: it is cast from his hands (sling-ring gesture in front of his chest) and
+    slides to the portal centre as it grows, so it always stays inside the ring."""
+    s = _ss(T_REL, T_FRONT1, t)
+    s = np.asarray(s, np.float64)[..., None]
+    return FC0 + (CF - FC0) * s
+
+
 def _front_R(t, R):
-    """Radius of the reality front (raw footage inside) during the wipe."""
+    """Radius of the reality front (raw footage inside) during the wipe (never outside the ring)."""
     t = np.asarray(t, np.float64)
-    return np.where(t >= T_REL, R * _ss(T_REL, T_FRONT1, t) ** 0.85, 0.0)
+    d = np.linalg.norm(_front_C(t) - CF, axis=-1)
+    rp = np.minimum(R * _ss(T_REL, T_FRONT1, t) ** 0.85, np.maximum(R - d - 6.0, 0.0))
+    return np.where(t >= T_REL, rp, 0.0)
 
 
 def _pre(t):
@@ -544,7 +555,7 @@ class FX(core.Effect):
         th_b = rng.uniform(-np.pi, np.pi, nb)
         Rp_b = _front_R(te_b, self._tab(self.tR, te_b))
         rd_b = np.stack([np.cos(th_b), np.sin(th_b)], -1)
-        p_b = CF + rd_b * (Rp_b * self.rim_factor(th_b, te_b))[:, None]
+        p_b = _front_C(te_b) + rd_b * (Rp_b * self.rim_factor(th_b, te_b))[:, None]
         on = _sample_lo(te_b, p_b, _suit_lo) > 0.5
         te_b, rd_b, p_b = te_b[on], rd_b[on], p_b[on]
         nb = len(te_b)
@@ -616,6 +627,7 @@ class FX(core.Effect):
                   gather=float(_gather(t)) if t < T_REL else 0.0)
         # wipe: reality front (person + everything) radius, follows from the portal centre
         st['Rp'] = float(_front_R(t, R))
+        st['Fc'] = _front_C(t)
         # flicker of the whole ring (subtle, never strobing) + crackle (word bursts) for the hand light
         fi = S.i
         st['flick'] = 0.92 + 0.08 * np.sin(fi * 2.1) * np.sin(fi * 0.77 + 1.3) + 0.05 * (_hash([7], fi)[0] - 0.5)
@@ -652,7 +664,7 @@ class FX(core.Effect):
     def background(self, S):
         st = self.state(S)
         S.meta['strange'] = dict(cen=(float(st['cen'][0]), float(st['cen'][1])), R=st['R'], b=st['b'],
-                                 front_c=(float(CF[0]), float(CF[1])), front_R=st['Rp'],
+                                 front_c=(float(st['Fc'][0]), float(st['Fc'][1])), front_R=st['Rp'],
                                  wipe=float(_ss(T_REL, 74.5, st['t'])))
         S._strange_store = store = dict(emit=[], plate=None)
         if self._done(st) or st['b'] < 0.5:
@@ -689,7 +701,9 @@ class FX(core.Effect):
             m, edge = self._aperture(st, (x0, y0, x1, y1), R - inset)
         else:
             m = self.disk_mask(cen, R, t, (y1 - y0, x1 - x0), (x0, y0), inset=inset, soft=1.2)
-        view = A.plate(0)[y0:y1, x0:x1]
+        # the bathroom through the portal, pre-corrected like the raw footage so it is exactly the view the
+        # wipe later restores (no brightness seam at the reality front)
+        view = _plate_raw()[y0:y1, x0:x1]
         # warm spill from the ring onto the other side + slight darkening at the very rim
         X, Y = core.grid(y1 - y0, x1 - x0, (x0, y0))
         rho = np.sqrt((X - cen[0]) ** 2 + (Y - cen[1]) ** 2)
@@ -1150,7 +1164,7 @@ void main(){
                 img = raw.copy()
                 occ = araw
             elif Rp > 1.0:
-                mfront = self.disk_mask(CF, Rp, t, soft=2.0)
+                mfront = self.disk_mask(st['Fc'], Rp, t, soft=2.0)
                 rawp = self._relight_raw(S, st, raw, araw)
                 img = img * (1 - mfront)[..., None] + rawp * mfront[..., None]
                 occ = S.alpha * (1 - mfront) + araw * mfront
@@ -1226,13 +1240,14 @@ void main(){
         ys, xs = np.nonzero(pa[::8, ::8] > 0.05)
         if not len(xs):
             return
-        bx0, by0 = max(int(CF[0] - rm), xs.min() * 8 - 8, 0), max(int(CF[1] - rm), ys.min() * 8 - 8, 0)
-        bx1, by1 = min(int(CF[0] + rm), xs.max() * 8 + 16, W), min(int(CF[1] + rm), ys.max() * 8 + 16, H)
+        Fc = st['Fc']
+        bx0, by0 = max(int(Fc[0] - rm), xs.min() * 8 - 8, 0), max(int(Fc[1] - rm), ys.min() * 8 - 8, 0)
+        bx1, by1 = min(int(Fc[0] + rm), xs.max() * 8 + 16, W), min(int(Fc[1] + rm), ys.max() * 8 + 16, H)
         if bx1 <= bx0 or by1 <= by0:
             return
         X, Y = core.grid(by1 - by0, bx1 - bx0, (bx0, by0))
-        rho = np.sqrt((X - CF[0]) ** 2 + (Y - CF[1]) ** 2)
-        th = np.arctan2(Y - CF[1], X - CF[0])
+        rho = np.sqrt((X - Fc[0]) ** 2 + (Y - Fc[1]) ** 2)
+        th = np.arctan2(Y - Fc[1], X - Fc[0])
         dd = rho - Rp * self.rim_factor(th, t)
         near = np.abs(dd) < 80
         if not near.any():
@@ -1355,6 +1370,16 @@ def _inv_tonemap(y):
 
 
 _RL = None
+_PR = None
+
+
+def _plate_raw():
+    """Clean bathroom plate 0 as linear values that the compositor's tonemap maps back to the plate's sRGB."""
+    global _PR
+    if _PR is None:
+        im = cv2.imread(f'{C.PLATES}/plate0.png', cv2.IMREAD_COLOR)[:, :, ::-1]
+        _PR = np.ascontiguousarray(_RAW_LUT()[im])
+    return _PR
 
 
 def _RAW_LUT():

@@ -134,6 +134,16 @@ class Geometry:
         self.nose = _gauss_smooth_series(nose, np.ones(N, bool), 1.2)
         # confidence (1 = good face mesh around this time)
         self.face_conf = np.clip(_smooth1d(valid.astype(np.float32), 3.0), 0, 1)
+        # distance (frames) to the nearest valid mesh: a synthesised oval is reliable a few
+        # frames from a real one, garbage far from it (back of the head)
+        vi = np.where(valid)[0]
+        ii = np.arange(N)
+        if len(vi):
+            k = np.clip(np.searchsorted(vi, ii), 0, len(vi) - 1)
+            km = np.clip(k - 1, 0, len(vi) - 1)
+            self.face_dist = np.minimum(np.abs(ii - vi[k]), np.abs(ii - vi[km])).astype(np.float32)
+        else:
+            self.face_dist = np.full(N, 999.0, np.float32)
         # face size reference: interpolated over valid frames (follows lean-ins), smoothed
         idx = np.arange(N)
         self.fh_ref = _smooth1d(np.interp(idx, idx[valid], fh[valid]).astype(np.float32), 3.0)
@@ -142,6 +152,16 @@ class Geometry:
         # ---------------- pose smoothing (light) -----------------------------------------
         self.pose_s = _gauss_smooth_series(P[:, :, :2], np.ones(N, bool), 1.0)
         self.vis_s = _gauss_smooth_series(P[:, :, 3], np.ones(N, bool), 1.5)
+        # frontal-ness from the pose: nose inside the ear span and ears well apart.  A
+        # synthesised (frontal) face oval is trustworthy when frontal (hand over the face),
+        # garbage in profile / back views.
+        ps_ = self.pose_s
+        e78 = ps_[:, 7] - ps_[:, 8]
+        ed_ = np.linalg.norm(e78, axis=1)
+        ax_ = e78 / np.maximum(ed_, 1.0)[:, None]
+        no_ = np.abs(((ps_[:, 0] - 0.5 * (ps_[:, 7] + ps_[:, 8])) * ax_).sum(1)) / np.maximum(ed_ * 0.5, 1.0)
+        fr_ = np.clip((1.6 - no_) / 0.5, 0, 1) * np.clip((ed_ / np.maximum(self.fw_ref, 1) - 0.40) / 0.15, 0, 1)
+        self.frontal = np.clip(_smooth1d(fr_.astype(np.float32), 1.5), 0, 1)
         shd = _smooth1d(np.linalg.norm(self.pose_s[:, 11] - self.pose_s[:, 12], axis=1), 2.0)
         self.sw = np.maximum(shd, 1.45 * self.fh_ref).astype(np.float32)
 

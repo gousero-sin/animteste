@@ -88,8 +88,8 @@ void main(){
         vec3 gasCol = mix(vec3(0.42, 0.08, 0.78), vec3(0.05, 0.42, 0.75), sst(-0.3, 0.6, g2));
         float wallL = exp(-z * 1.1) * (0.18 + 0.82 * face);
         vec3 inner = vec3(0.002, 0.0015, 0.008);
-        inner += gasCol * gas * wallL * 0.55 * (0.6 + 0.4 * pw);
-        inner += vec3(0.55, 0.65, 1.3) * fil * gas * wallL * 0.55;
+        inner += gasCol * gas * wallL * 0.85 * (0.6 + 0.4 * pw);
+        inner += vec3(0.55, 0.65, 1.3) * fil * gas * wallL * 0.7;
         // wall occlusion: the deep end is darker between the gas lanes
         inner *= 0.55 + 0.45 * sst(0.0, 0.5, gas);
         // near-lip sheen (fresnel-like) and the lip's own shadow on the far wall just below it

@@ -107,12 +107,12 @@ MAX_LAG = 0.45         # max delay of a phrase behind speech (absorbed by the ne
 FOLLOW_WX, FOLLOW_WY = 8.0, 16.0  # critically damped spring rates (rad/s) -> ~0.25 s / ~0.12 s lag
 FOLLOW_GAIN = 0.70                # parallax: text moves 70 % of the head's motion
 FOLLOW_REF_S = 1.2                # s (sigma) of the slow reference the gain is taken around
-RECENTRE_W = 16.0                 # spring rate of the visible-word re-centring
-RECENTRE_ANT = 0.05               # the line starts making room slightly before a word rises
-CLAMP_W, CLAMP_ANT = 30.0, 0.12   # frame-edge clamp sees a new word (fast) before it appears
+RECENTRE_W = 0.45                 # duration (s) of the visible-word re-centring glide (smootherstep)
+RECENTRE_ANT = 0.36               # glide starts this long before the word rises: a fast phrase
+                                  # appears already centred, a slow one makes room early
 
 # ---- layout solver
-SOLVER = 'v3-dp-10'
+SOLVER = 'v3-dp-15'
 Q = 6.0                           # solver resolution: 1/6 of the output frame
 ZOOMS = (1.0, 0.86, 0.72, 0.60)
 LIFTS = (0.0, 0.12, 0.24, 0.38, 0.52, 0.68, 0.85, 1.1, 1.4, 1.75)
@@ -375,6 +375,14 @@ def _cd_step(tau, w):
         return 0.0
     x = w * tau
     return 1.0 - (1.0 + x) * math.exp(-x)
+
+
+def _smoother(tau, dur):
+    """Smootherstep 0 -> 1 over dur (zero velocity and acceleration at both ends: min jerk)."""
+    if tau <= 0:
+        return 0.0
+    x = min(tau / dur, 1.0)
+    return x * x * x * (x * (6.0 * x - 15.0) + 10.0)
 
 
 def _crit_follow(x, w, dt, sub=4):
@@ -676,20 +684,31 @@ class FX(core.Effect):
             return 1.0 - _ss(49.75, 50.45, t)
         return _ss(54.05, 54.55, t)      # he has landed out of the arrival portal
 
-    def _vis_x1(self, P, ph, t, w=RECENTRE_W, ant=RECENTRE_ANT):
-        """Right edge (line px) of the words revealed so far, spring-smoothed."""
+    def _stages(self, P, ph, t):
+        """Reveal stages of the line: [(x1_k, weight_k)], x1_k = right edge (line px) of words
+        0..k, weights a partition of unity that glides (smootherstep) from one stage to the next
+        RECENTRE_ANT s before word k rises. Words due when the phrase appears are there from the
+        start (no glide while the line is still rising out of the slot)."""
         words = ph['words']
         if P['mode'] == 'tunnel' or len(words) == 1:
-            return ph['lw']
-        x1 = words[0]['x1']
+            return [(ph['lw'], 1.0)]
+        prog = [1.0]
         for j in range(1, len(words)):
-            s = _cd_step(t - float(self.wt[words[j]['wid']]) + ant, w)
-            x1 += (words[j]['x1'] - words[j - 1]['x1']) * s
-        return x1
+            t0 = float(self.wt[words[j]['wid']]) - RECENTRE_ANT
+            prog.append(1.0 if t0 <= P['show'] + 0.04 else _smoother(t - t0, RECENTRE_W))
+        prog.append(0.0)
+        return [(words[k]['x1'], prog[k] - prog[k + 1]) for k in range(len(words))
+                if prog[k] - prog[k + 1] > 1e-6]
+
+    def _vis_x1(self, P, ph, t):
+        """Right edge (line px) of the words visible now, smoothed."""
+        return sum(x1 * wk for x1, wk in self._stages(P, ph, t))
 
     def _anchor_raw(self, i, t, P, ph, lift=0.0, shift=0.0, zoom=1.0, offset=(0.0, 0.0)):
         """Phrase anchor for frame i (pure function): (x of the line centre, baseline y, scale,
-        tilt, unlifted crown-slot baseline y)."""
+        tilt, unlifted crown-slot baseline y). The visible words are centred on the (followed)
+        head and softly clamped into the frame per reveal stage; stages are cross-blended, so
+        making room for a new word is always one even glide."""
         hx, hy = float(self.fx[i]) + offset[0], float(self.fy[i]) + offset[1]
         flen = float(self.track['flen'][i])
         sd = _clamp((flen / 211.0) ** 0.5, 0.88, 1.22)
@@ -699,14 +718,13 @@ class FX(core.Effect):
         cap = ph['cap'] * sc
         slot = (hy + OVERLAP * cap) * p + (H / 2 + 0.5 * cap) * (1 - p)
         ay = slot - lift * cap * p
-        x1v = self._vis_x1(P, ph, t)
-        x1c = max(x1v, self._vis_x1(P, ph, t, CLAMP_W, CLAMP_ANT))
         xc = (hx + shift) * p + (W / 2) * (1 - p)       # where the visible words are centred
-        # keep [line start, end of the words about to be visible] inside the frame (soft, C2)
-        cc = xc + 0.5 * sc * (x1c - x1v)
-        half = 0.5 * sc * x1c + 34.0
-        cc = W / 2 if half > W / 2 else _soft_clamp(cc, half, W - half, 70.0)
-        ax = cc - 0.5 * sc * x1c + 0.5 * sc * ph['lw']
+        left = 0.0
+        for x1, wk in self._stages(P, ph, t):
+            half = 0.5 * sc * x1 + 34.0
+            c = W / 2 if half > W / 2 else _soft_clamp(xc, half, W - half, 70.0)
+            left += wk * (c - 0.5 * sc * x1)
+        ax = left + 0.5 * sc * ph['lw']
         tilt = math.radians(_clamp(-float(self.fvx[i]) * 0.16, -2.2, 2.2)) * p
         return float(ax), float(ay), float(sc), tilt, float(slot)
 
@@ -1035,7 +1053,7 @@ class FX(core.Effect):
     def _layout_all(self):
         """Per-phrase layout tracks (lift, shift, zoom per frame), cached per phrase."""
         ctx = hashlib.md5(repr((SOLVER, self.track['hash'], FOLLOW_WX, FOLLOW_WY, FOLLOW_GAIN, FOLLOW_REF_S,
-                                RECENTRE_W, RECENTRE_ANT, CLAMP_W, CLAMP_ANT, ZOOMS, LIFTS, SHIFTS, LAM, LOOK, OVERLAP, BASE_CAP, MAX_LINE,
+                                RECENTRE_W, RECENTRE_ANT, ZOOMS, LIFTS, SHIFTS, LAM, LOOK, OVERLAP, BASE_CAP, MAX_LINE,
                                 SHORT_LINE, SHORT_BOOST, EMPH, Q, RING_T0, RING_T1,
                                 self._presence(54.3), self._presence(50.1))).encode()).hexdigest()[:8]
         out = {}

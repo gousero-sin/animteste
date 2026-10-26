@@ -201,7 +201,7 @@ class FX(core.Effect):
             fg_src, a_src = S.raw_fg, S.raw_alpha
         else:
             fg_src, a_src = S.fg, S.alpha
-        res = self._render_suit(i, t, fg_src, a_src)
+        res = self._render_suit(i, t, fg_src, a_src, S.raw_fg)
         if res is None:
             return
         fg_c, emis_c, box = res
@@ -234,7 +234,7 @@ class FX(core.Effect):
             bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
             S.meta['suit_emis'] = (em[by0:by1, bx0:bx1].copy(), (bx0, by0))
 
-    def _render_suit(self, i, t, fg_full, a_full):
+    def _render_suit(self, i, t, fg_full, a_full, raw_full=None):
         an = self._anim(t)
         # body crop from the matte (quarter-res search)
         q = 8
@@ -250,7 +250,8 @@ class FX(core.Effect):
         w, h = x1 - x0, y1 - y0
         fg = np.ascontiguousarray(fg_full[y0:y1, x0:x1])
         al = np.ascontiguousarray(a_full[y0:y1, x0:x1])
-        M = suit_mask.build(self.geo, i, (x0, y0, x1, y1), fg, al)
+        raw = fg if raw_full is None else np.ascontiguousarray(raw_full[y0:y1, x0:x1])
+        M = suit_mask.build(self.geo, i, (x0, y0, x1, y1), raw, al)
         sw = M['sw']
         # ---- smoothed skin luminance (anatomy) with small dark features closed away
         lum = fg[..., 0] * 0.2126 + fg[..., 1] * 0.7152 + fg[..., 2] * 0.0722

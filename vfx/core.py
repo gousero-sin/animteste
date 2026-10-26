@@ -330,15 +330,15 @@ class Compositor:
         for e in fx:
             img = e.post(S, img)
         img = _bloom(img, S.bloom)
-        if S.shake:
-            dx = sum(s[0] for s in S.shake)
-            dy = sum(s[1] for s in S.shake)
-            rot = sum(s[2] for s in S.shake)
-            if abs(dx) + abs(dy) + abs(rot) > 0.05:
-                zoom = 1.0 + min(0.08, (abs(dx) + abs(dy)) / W * 2.2 + abs(rot) * 0.01)
-                M = cv2.getRotationMatrix2D((W / 2, H / 2), rot, zoom)
-                M[:, 2] += (dx, dy)
-                img = cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        dx = sum(s[0] for s in S.shake)
+        dy = sum(s[1] for s in S.shake)
+        rot = sum(s[2] for s in S.shake)
+        cz, ccx, ccy = camera_move(S.t)
+        if abs(dx) + abs(dy) + abs(rot) > 0.05 or cz > 1.0005:
+            zoom = cz * (1.0 + min(0.08, (abs(dx) + abs(dy)) / W * 2.2 + abs(rot) * 0.01))
+            M = cv2.getRotationMatrix2D((ccx, ccy), rot, zoom)
+            M[:, 2] += (dx, dy)
+            img = cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         if return_linear:
             return img, S
         img = _tonemap(img)
@@ -352,6 +352,27 @@ class Compositor:
             g = cv2.resize(g, (W, H), interpolation=cv2.INTER_LINEAR)
             out = out + g[..., None] * S.grain
         return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8), S
+
+
+# Editorial camera moves applied to the finished frame (zoom about a point), to keep long
+# talking stretches alive: a slow push-in during the studio monologue that eases back out as
+# the ceiling portal arrives, and a slow push-in in space that pulls back to reveal the black
+# hole on "aqui tem um buraco negro". (t0, t1, zoom0, zoom1, cx, cy)
+CAMERA_KEYS = [
+    (34.40, 43.30, 1.000, 1.075, 560.0, 1000.0),
+    (43.30, 45.70, 1.075, 1.000, 560.0, 1000.0),
+    (54.80, 61.70, 1.000, 1.060, 540.0, 980.0),
+    (61.70, 62.60, 1.060, 1.000, 540.0, 980.0),
+]
+
+
+def camera_move(t):
+    """(zoom, cx, cy) of the editorial camera at time t (zoom 1 = untouched frame)."""
+    for t0, t1, z0, z1, cx, cy in CAMERA_KEYS:
+        if t0 <= t < t1:
+            u = float(ease_in_out((t - t0) / (t1 - t0)))
+            return z0 + (z1 - z0) * u, cx, cy
+    return 1.0, W / 2, H / 2
 
 
 _VG = None

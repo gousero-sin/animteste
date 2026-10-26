@@ -159,6 +159,15 @@ def sat(x, drive=2.0):
     return np.tanh(drive * x) / np.tanh(drive)
 
 
+def glue(x, drive=2.0):
+    """Transient glue: soft-saturate relative to the peak (lower crest -> louder at the same true peak,
+    so big hits gain loudness instead of limiter gain reduction)."""
+    pk = np.abs(x).max()
+    if pk <= 0:
+        return x
+    return np.tanh(drive * x / pk) / np.tanh(drive) * pk
+
+
 def put(out, x, t, gain=1.0, pan=None):
     """Mix x (mono or stereo) into the stereo buffer `out` at time t (s, may be negative)."""
     x = np.asarray(x, np.float64)
@@ -486,6 +495,9 @@ def load_beats():
     after = tgs >= B['sg_rel']
     B['sg_edge'] = _first_cross(tgs[after], Rs[after], r_mid)      # rim sweeping across the frame edges
     B['sg_out'] = _first_cross(tgs[after], Rs[after], r_out)       # rim has left the frame entirely
+    for k in ('sg_edge', 'sg_out'):
+        BEAT_SRC[k] = 'derived: strange._R_scalar crosses the frame edges / farthest corner from CF'
+    BEAT_SRC['st_front_peak'] = 'derived: max of visible front length x dR/dt (cleanup_shatter.front_R)'
     return B
 
 
@@ -904,7 +916,8 @@ def voice_vad(m):
     act = minimum_filter1d(act.astype(np.uint8), 5).astype(bool)
     act = minimum_filter1d(act.astype(np.uint8), 5).astype(bool)
     act = maximum_filter1d(act.astype(np.uint8), 5).astype(bool)
-    hang = maximum_filter1d(act.astype(np.uint8), 29, origin=-7).astype(bool)   # [-60 ms, +220 ms]
+    hang = maximum_filter1d(act.astype(np.uint8), 29, origin=7).astype(bool)    # window [k-210 ms, k+70 ms]:
+    #                                                         210 ms hangover after speech, 70 ms pre-roll
     return hang, core, lv, thr
 
 
@@ -932,6 +945,7 @@ def tame_transients(v, core, thr_db=15.0, red_db=9.0):
     nf = len(v) // hop + 1
     crf = maximum_filter1d(np.pad(cr, (0, nf * hop - len(cr)), constant_values=0).reshape(nf, hop).max(1), 3)
     pkf = np.pad(pk, (0, nf * hop - len(pk))).reshape(nf, hop).max(1)
+    core = maximum_filter1d(minimum_filter1d(core.astype(np.uint8), 8), 8).astype(bool)   # runs >= 80 ms only
     coref = np.repeat(maximum_filter1d(core.astype(np.uint8), 7).astype(bool), 10)
     coref = np.pad(coref, (0, max(0, nf - len(coref))))[:nf]
     det = (crf > thr_db) & ~coref & (pkf > np.abs(v).max() * undb(-30))
@@ -1317,7 +1331,7 @@ def sfx_studio(B):
     # 9. the two light bars strike on
     for tt_, pn, sd_ in ((B['st_rim_l'], B['pan_bar_l'], 450), (B['st_rim_r'], B['pan_bar_r'], 451)):
         put(out, light_strike(rng(sd_)) * 0.85, rel(tt_), pan=pn)
-    return out, s0
+    return glue(out, 1.6), s0
 
 
 def sfx_studio_tone(B):
@@ -1371,7 +1385,7 @@ def sfx_suit_hits(B):
     pw = (sine(hz('E5'), m) + 0.5 * sine(hz('B5'), m) + 0.25 * sine(hz('E6') * 1.002, m))
     pw *= env_pts(tl, [(0, 0), (0.12, 1), (0.5, 0.5), (1.4, 0)])
     put(out, pw * 0.12, a + 0.06)
-    return out, s0
+    return glue(out, 1.6), s0
 
 
 def sfx_suit_bed(B):
@@ -1448,12 +1462,12 @@ def sfx_fire_ignite():
     fl = butter(fl, 'high', 3500, 2) * (env_ar(tb, 0.005, 0.12) * (t > b0))[:, None]
     out += fl * 0.35
     th = sub_drop(1.2, 95, 50, 0.08, 0.3, 2.2, harm=0.5)
-    put(out, th * 0.8, b0)
+    put(out, th * 0.55, b0)
     put(out, impact(r, 260, 130, 0.08, 1800, body=0.8, noise=0.9, click_amt=0.5, dur=0.6) * 0.6, b0)
     cr = crackle(T, lambda tt: np.where(tt > b0, 220 * np.exp(-(tt - b0) / 0.25), 0) + 1, 800, 5000,
                  (0.002, 0.01), 703, None, 0.4, 1.4)
     out += cr * 0.6
-    return out
+    return glue(out, 1.8)
 
 
 def fire_bed(T, pan_fn, t_abs0, seed=710):
@@ -1517,7 +1531,7 @@ def sfx_ice_form(B):
     put(out, snap * 0.8, L)
     put(out, impact(r, 320, 190, 0.05, 3000, body=0.6, noise=0.5, click_amt=0.7, dur=0.35) * 0.55, L)
     put(out, sub_drop(0.6, 120, 70, 0.03, 0.12, 1.6, harm=0.5) * 0.35, L)
-    return out, s0
+    return glue(out, 1.5), s0
 
 
 def ice_bed(T, pan_fn, t_abs0, seed=820):
@@ -1554,19 +1568,19 @@ def sfx_fusion_converge(B, panR, panL):
     pw = whoosh(T, [(0, 2500), (B['push1'] - s0, 1200), (T, 1200)],
                 [(0, 0), (0.12, 0.35), (B['push1'] - s0, 0.0), (T, 0)], bw=0.5, seed=931, corr=0.5)
     out += widen(pw, 1.3) * 0.3
-    amp = [(0, 0), (a, 0), (a + 0.08, 0.2), (b - 0.04, 1.0), (b + 0.02, 0.25), (b + 0.35, 0), (T, 0)]
+    amp = [(0, 0), (a, 0), (a + 0.08, 0.3), (b - 0.05, 1.0), (b + 0.02, 0.3), (b + 0.35, 0), (T, 0)]
     fw = whoosh(T, [(0, 450), (a, 450), (b, 1700), (T, 900)], amp, bw=0.8, seed=932, corr=0.6,
                 tone=([(0, 150), (a, 150), (b, 330), (T, 200)], 0.25))
     fw *= (1 + 0.35 * lfo_noise(n, 18, 933))[:, None]
-    out += pan2(fw * 0.7, float(panR(f0)) * (1 - k))
+    out += pan2(fw * 1.4, float(panR(f0)) * (1 - k))
     iw = whoosh(T, [(0, 2600), (a, 2600), (b, 7500), (T, 7000)], amp, bw=0.45, seed=934, corr=0.6, slope=0.0)
-    out += pan2(iw * 0.55, float(panL(f0)) * (1 - k))
+    out += pan2(iw * 1.1, float(panL(f0)) * (1 - k))
     gl = a + np.sort(r.uniform(0, b - a, 12))
     out += sparkle(T, gl, [hz(x) for x in ('E7', 'B7', 'F#7')], 935,
                    lambda tt: float(panL(f0)) * (1 - smooth01(np.clip((tt - a) / (b - a), 0, 1))), 0.15, (0.03, 0.1), 0.25)
     # ring entry: soft whump + violet shimmer
-    put(out, impact(r, 230, 120, 0.09, 1600, body=0.9, noise=0.6, click_amt=0.3, dur=0.6) * 0.6, b)
-    put(out, sub_drop(0.9, 90, 48, 0.08, 0.25, 2.0, harm=0.5) * 0.5, b)
+    put(out, impact(r, 230, 120, 0.09, 1600, body=0.9, noise=0.6, click_amt=0.3, dur=0.6) * 0.45, b)
+    put(out, sub_drop(0.9, 90, 48, 0.08, 0.25, 2.0, harm=0.5) * 0.35, b)
     m = n - ns(b)
     tl = tvec(m)
     sh = sum(sine(hz(x) * (1 + 0.003 * j), m) * env_ar(tl - 0.03 * j, 0.01, 0.5) * (tl > 0.03 * j) / (1 + 0.4 * j)
@@ -1687,12 +1701,12 @@ def sfx_boom(B):
     bl = noise2(n, 1001, -0.6, 0.5)
     bl = spec(bl, lambda f, tt: g_lp(f, 250 + 14000 * np.exp(-tt / 0.22), 2) * g_hp(f, 40, 2))
     bl *= env_ar(t, 0.003, 0.55)[:, None] * (1 + 0.25 * lfo_noise(n, 25, 1002))[:, None]
-    out += bl * 1.2
-    put(out, impact(r, 300, 90, 0.22, 2000, body=1.0, noise=0.9, click_amt=0.6, dur=1.4) * 0.9, 0.0)
+    out += bl * 1.35
+    put(out, impact(r, 300, 90, 0.22, 2000, body=1.0, noise=1.0, click_amt=0.6, dur=1.4) * 1.1, 0.0)
     bo = butter(colored(n, 1003, -2), 'low', 320, 2) * env_ar(t, 0.004, 0.35)
     out += pan2(bo * 0.8, 0)
-    sd = sub_drop(T, 75, 26, 0.35, 1.3, 2.8, 0.003, harm=0.55)
-    out += pan2(sd * 1.15, 0)
+    sd = sub_drop(T, 75, 26, 0.35, 1.3, 2.8, 0.003, harm=0.6)
+    out += pan2(sd * 0.6, 0)
     sw = whoosh(1.4, [(0, 2500), (0.6, 600), (1.4, 250)], [(0, 0.0), (0.04, 1), (1.4, 0)], bw=0.7, seed=1004, corr=0.3)
     sw = widen(sw, np.interp(tvec(len(sw)), [0, 0.8], [0.6, 1.4]))
     out[:len(sw)] += sw * 0.7
@@ -1706,9 +1720,9 @@ def sfx_boom(B):
     out += emb * 0.45
     ru = noise2(n, 1007, -2.0, 0.8)
     ru = butter(ru, 'low', 140, 2) * env_ar(t, 0.05, 0.9)[:, None]
-    out += ru * 0.6
+    out += ru * 0.38
     out = norm_peak(out)
-    return sat(out, 2.6), B['boom']
+    return sat(out, 3.6), B['boom']
 
 
 def sfx_portal_open_hit(B):
@@ -1731,7 +1745,7 @@ def sfx_portal_open_hit(B):
     rv = whoosh(0.4, [(0, 300), (0.4, 2500)], [(0, 0), (0.39, 1.0), (0.4, 0)], bw=0.6, seed=1102, corr=0.5)
     put(out, rv * 0.7, a - 0.4)
     put(out, impact(r, 230, 100, 0.14, 2200, body=1.0, noise=0.8, click_amt=0.6, dur=1.0) * 0.8, a)
-    put(out, sub_drop(2.5, 60, 32, 0.3, 0.9, 2.2, harm=0.55) * 0.6, a)
+    put(out, sub_drop(2.5, 60, 32, 0.3, 0.9, 2.2, harm=0.55) * 0.32, a)
     cb = crackle(2.5, lambda tt: 120 * np.exp(-tt / 0.2) + 1, 900, 6000, (0.0015, 0.008), 1103, None, 0.7, 1.6, 3)
     put(out, cb * 0.55, a)
     m = ns(2.5)
@@ -1739,7 +1753,7 @@ def sfx_portal_open_hit(B):
     put(out, sh * env_ar(tvec(m), 0.05, 0.8) * 0.12, a)
     rw = whoosh(0.9, [(0, 2500), (0.9, 500)], [(0, 0), (0.03, 1.0), (0.9, 0)], bw=0.6, seed=1104, corr=0.4)
     put(out, widen(rw, np.interp(tvec(len(rw)), [0, 0.6], [0.7, 1.4])) * 0.75, a)
-    return out, s0
+    return glue(out, 1.8), s0
 
 
 def portal_vortex_bed(B):
@@ -1758,7 +1772,7 @@ def portal_vortex_bed(B):
     rph = TAU * np.cumsum(rot) / SR
     ru = butter(colored(n, sd + 2, -2.0), 'low', 130, 2)
     ru += sat(sine(hz('D1'), n) + 0.5 * sine(hz('D1') * 1.01, n), 1.5) * 0.4
-    out += pan2(ru * grow * (0.8 + 0.2 * np.sin(rph)) * 0.55, 0)
+    out += pan2(ru * grow * (0.8 + 0.2 * np.sin(rph)) * 0.4, 0)
     wn = colored(n, sd + 3, -1)
     fc = 800 * 2 ** (1.0 * np.sin(rph * 0.7))
     wn = spec(wn, lambda f, tt: g_bp(f, np.interp(tt, t, fc), 0.5))
@@ -1768,7 +1782,7 @@ def portal_vortex_bed(B):
     fc2 = 750 * 2 ** (0.9 * np.sin(rph + 1.7))
     sw = spec(sw, lambda f, tt: g_bp(f, np.interp(tt, t, fc2), 0.6) * g_hp(f, 300, 2) * g_lp(f, 2000, 2))
     sw = flanger(sw, 0.8, 3.0, 0.6 + 0.4 * rot, 0.8, sd + 11, 3)
-    out += pan2(sw * grow * 0.45, -0.45 * np.sin(rph + 0.8))
+    out += pan2(sw * grow * 0.6, -0.45 * np.sin(rph + 0.8))
     times = poisson_times(T, lambda tt: 4 + 3 * tt / T, sd + 5)
     zr = rng(sd + 6)
     out += grains(T, times, lambda k, q: zap(q, q.uniform(0.03, 0.1), 1.3) * q.uniform(0.2, 0.7),
@@ -1785,14 +1799,14 @@ def sfx_suck(d):
     t = tvec(n)
     u = np.clip(t / d, 0, 1)
     out = np.zeros((n, 2))
-    ri = whoosh(T, [(0, 300), (d * 0.85, 5000), (d, 7000), (T, 7000)], [(0, 0.05), (d * 0.8, 0.8), (d, 0.2), (T, 0)],
-                bw=0.5, seed=1200)
+    ri = whoosh(T, [(0, 300), (d * 0.55, 800), (d * 0.85, 5000), (d, 7000), (T, 7000)],
+                [(0, 0.05), (d * 0.55, 0.35), (d * 0.8, 0.8), (d, 0.2), (T, 0)], bw=0.5, seed=1200)
     out += ri * 0.7
     sh = shepard(T, 0.8 + 3 * u, 800, 7, True, 1201) * smooth01(u * 2) * (t < d)
     out += pan2(sh * 0.22, 0)
     f = 220 * 2 ** (2 * u ** 1.5) * (1 + 0.03 * u * np.sin(TAU * (4 + 10 * u) * t))
     st = saw(f, n) * 0.3 + sine(f, n)
-    st = butter(st, 'low', 3000, 2) * smooth01(u * 3) * (1 - smooth01((t - d + 0.1) / 0.1))
+    st = butter(st, 'low', 3000, 2) * smooth01((u - 0.4) * 3) * (1 - smooth01((t - d + 0.1) / 0.1))
     out += pan2(st * 0.16, 0)
     pk = 0.75 * d
     wu = whoosh(T, [(0, 600), (pk, 2600), (T, 400)], [(0, 0), (pk - 0.25, 0.4), (pk, 1.0), (d, 0.25), (T, 0)],
@@ -1836,7 +1850,7 @@ def sfx_portal_close(B):
     rv *= 0.5 * rms_max(hit, 0.05) / max(rms_max(rv[-ns(0.05):], 0.05), 1e-9)     # -6 dB re hit
     out[:i0] += rv[-i0:]
     out[i0:] += hit
-    return out, c0
+    return glue(out, 1.8), c0
 
 
 def tunnel_speed(B, t):
@@ -1889,7 +1903,7 @@ def sfx_tunnel_hits(B):
     r = rng(1460)
     tj = B['jolt'] - a
     put(out, impact(r, 190, 70, 0.12, 1500, body=1.0, noise=0.8, click_amt=0.5, dur=0.8) * 0.8, tj)
-    put(out, sub_drop(1.0, 70, 35, 0.1, 0.35, 2.2, harm=0.5) * 0.7, tj)
+    put(out, sub_drop(1.0, 70, 35, 0.1, 0.35, 2.2, harm=0.5) * 0.2, tj)
     dd = 0.3
     w = whoosh(dd, [(0, 3200), (dd * 0.45, 1500), (dd, 450)], [(0, 0), (dd * 0.45, 1), (dd, 0)], bw=0.55, seed=1461, corr=0.5)
     put(out, pan2(w, np.linspace(-0.8, 0.8, len(w))) * 1.0, tj - dd * 0.45)
@@ -1897,7 +1911,7 @@ def sfx_tunnel_hits(B):
     put(out, rt * 0.4, tj)
     rc = whoosh(0.38, [(0, 5000), (0.38, 9000)], [(0, 0), (0.37, 1), (0.38, 0)], bw=0.6, seed=1452, slope=0.0)
     put(out, rc * 0.8, d - 0.38)
-    return out, a
+    return glue(out, 1.6), a
 
 
 def sfx_exit_flash():
@@ -1914,7 +1928,7 @@ def sfx_exit_flash():
     out += bl * env_ar(t, 0.004, 0.6)[:, None] * 0.65
     sh = sum(sine(hz(x) * (1 + 0.002 * j), n) / (1 + 0.4 * j) for j, x in enumerate(('D5', 'A5', 'D6', 'F#6', 'A6', 'E7')))
     out += pan2(sh * env_ar(t, 0.02, 1.4) * 0.12, 0)
-    return out
+    return glue(out, 1.8)
 
 
 def sfx_arrive(B):
@@ -1930,7 +1944,7 @@ def sfx_arrive(B):
     w = whoosh(L + 0.05, [(0, 4500), (L - 0.05, 500), (L + 0.05, 400)], [(0, 0), (L * 0.55, 0.8), (L, 0.15), (L + 0.05, 0)],
                bw=0.6, seed=1600, tone=([(0, 700), (L, 180), (L + 0.05, 160)], 0.15))
     put(out, w * 0.75, 0.0)
-    put(out, sub_drop(1.0, 80, 45, 0.06, 0.25, 1.8, harm=0.5) * 0.6, L)
+    put(out, sub_drop(1.0, 80, 45, 0.06, 0.25, 1.8, harm=0.5) * 0.4, L)
     put(out, impact(r, 380, 200, 0.06, 2600, body=0.9, noise=0.9, click_amt=0.4, dur=0.5) * 0.6, L, pan=0.05)
     m = ns(0.12)
     fo = butter(r.standard_normal(m), 'band', [900, 4000], 2) * np.exp(-tvec(m) / 0.018)
@@ -1944,7 +1958,7 @@ def sfx_arrive(B):
     put(out, pp / (np.abs(pp).max() + 1e-9) * 0.35, P)
     st = P + 0.04 + np.sort(rng(1603).exponential(0.15, 7))
     out += sparkle(T, st, [hz(x) for x in ('A6', 'D7', 'E7')], 1604, None, 0.4, (0.1, 0.3), 0.18)
-    return out, s0
+    return glue(out, 1.6), s0
 
 
 def space_amb(T, seed=1700):
@@ -1989,7 +2003,8 @@ def sfx_blackhole_form(B):
     p0 = rr.uniform(-0.9, 0.9, len(times))
     kk = np.clip((times - fall0) / (I - fall0), 0, 1)
     pans = p0 + (pb - p0) * kk
-    out += grains(T, times, lambda k, q: click(q, q.uniform(1200, 4500) * (1 - 0.45 * kk[k]), 0.008, 2) * q.uniform(0.3, 1), pans, 1803) * 0.32
+    out += grains(T, times, lambda k, q: click(q, q.uniform(1200, 4500) * (1 - 0.45 * kk[k]), 0.008, 2) * q.uniform(0.3, 1)
+                  * (0.12 + 0.88 * kk[k] ** 1.5), pans, 1803) * 0.32                      # infall builds up, no lone clicks
     # gravity inhale (reverse swell) into the ignition: from the start of the growth
     L = I - g0
     rv = whoosh(L, [(0, 3000), (L, 280)], [(0, 0), (L - 0.02, 0.9), (L, 0)], bw=0.7, seed=1804, corr=0.5)
@@ -2003,7 +2018,7 @@ def sfx_blackhole_form(B):
     sh = sum(np.sin(TAU * fq * tl + r.uniform(0, TAU)) * np.exp(-tl / 0.05) for fq in (2900, 4300, 6100, 7700)) * 0.2
     put(out, (fl + sh) * 0.7, I, pan=pb)
     put(out, impact(r, 260, 110, 0.10, 2400, body=1.0, noise=0.8, click_amt=0.4, dur=0.8) * 0.7, I, pan=pb * 0.5)
-    put(out, sub_drop(2.2, 60, 28, 0.25, 0.75, 2.6, harm=0.55) * 0.65, I)
+    put(out, sub_drop(2.2, 60, 28, 0.25, 0.75, 2.6, harm=0.55) * 0.35, I)
     gw = whoosh(1.0, [(0, 2600), (0.35, 900), (1.0, 400)], [(0, 0), (0.015, 1.0), (0.3, 0.45), (1.0, 0)], bw=0.6,
                 seed=1805, corr=0.5, slope=-0.5)                                            # GW shock front
     put(out, widen(gw, np.interp(tvec(len(gw)), [0, 0.5], [0.7, 1.4])) * 0.6, I, pan=pb * 0.5)
@@ -2016,7 +2031,7 @@ def sfx_blackhole_form(B):
     wp = sat(wp * 0.8, 1.4) * env_pts(tl, [(0, 0), (0.025, 1), (0.35, 0.55), (1.3, 0)])
     put(out, wp * 0.32, I + 0.01, pan=pb * 0.4)
     put(out, sub_drop(1.4, 55, 32, 0.15, 0.4, 2.0, harm=0.3) * 0.2, I + 0.55)
-    return out, s0
+    return glue(out, 1.8), s0
 
 
 def blackhole_bed(T, seed=1850, pan=0.5):
@@ -2059,7 +2074,7 @@ def sfx_strange_bed(B, pan_fn):
     pan = pan_fn(ta)
     spin = 7.0 - 3.0 * np.clip((ta - B['sg_grow0']) / 1.0, 0, 1)
     sph = TAU * np.cumsum(spin) / SR
-    sz = noise2(n, 1900, 0.0, 0.5)
+    sz = noise2(n, 1900, 0.0, 0.7)
     sz = spec(sz, lambda f, tt: g_hp(f, 3500, 2) * g_lp(f, 12000, 4))
     micro = uniform_filter1d(np.clip(1 + 1.6 * colored(n, 1901, 0.0), 0, None) ** 3, 30)
     micro /= micro.mean() + 1e-9
@@ -2078,7 +2093,7 @@ def sfx_strange_bed(B, pan_fn):
     fc = 1200 * 2 ** (0.5 * np.sin(sph)) * (1 - 0.3 * rn)
     wh = spec(wh, lambda f, tt: g_bp(f, np.interp(tt, t, fc), 0.35))
     out += pan2(wh * np.clip(I, 0, 1.5) * 0.25, pan + 0.3 * np.sin(sph) * (0.3 + 0.7 * rn))
-    ro = noise2(n, 1904, -1.6, 0.6)
+    ro = noise2(n, 1904, -1.6, 0.75)
     ro = spec(ro, lambda f, tt: g_bp(f, 330, 1.0))
     out += widen(ro * (rn * np.clip(I, 0, 1.5))[:, None], 0.8 + 0.6 * rn) * 0.5
     ap0, ap1 = B['sg_ap0'] - a, B['sg_ap1'] - a
@@ -2105,7 +2120,7 @@ def sfx_strange_ign(B, pan):
     out = np.zeros((n, 2))
     r = rng(1950)
     cr = crackle(T, lambda tt: np.where(tt < ti - s0, 60, 0), 3000, 9000, (0.0006, 0.002), 1951, None, 0.1, 1.8)
-    out += cr * 0.25
+    out += cr * 0.08
     a = ti - s0
     m = ns(0.6)
     tl = tvec(m)
@@ -2142,18 +2157,18 @@ def sfx_wipe(B):
     put(out, impact(r, 280, 110, 0.08, 2200, body=1.0, noise=0.8, click_amt=0.8, dur=0.6) * 0.8, bpt)
     put(out, sub_drop(0.9, 75, 34, 0.1, 0.22, 2.4, harm=0.55) * 0.6, bpt)
     m = ns(0.08)
-    ck = butter(r.standard_normal((m, 2)), 'high', 1500, 2) * np.exp(-tvec(m) / 0.006)[:, None] * 1.6
+    ck = butter(r.standard_normal(m), 'high', 1500, 2) * np.exp(-tvec(m) / 0.006) * 0.8
     put(out, ck, bpt)
     m = ns(0.9)
     tl = tvec(m)
-    fz = butter(r.standard_normal((m, 2)), 'band', [3000, 11000], 2)
+    fz = butter(noise2(m, 2005, 0.0, 0.75), 'band', [3000, 11000], 2)
     fz *= (np.clip(1 + 2.0 * colored(m, 2002, 0.0), 0, None) ** 2 * env_ar(tl, 0.004, 0.22))[:, None] * 0.1
     put(out, fz, bpt)
     sp = crackle(1.2, lambda tt: 300 * np.exp(-tt / 0.18) + 2, 2500, 9000, (0.0008, 0.004), 2003, None, 0.8, 1.6)
     put(out, sp * 0.45, bpt)
     dw = whoosh(T, [(0, 500), (bpt, 600), (e, 3200), (o + 0.15, 700), (T, 350)],
                 [(0, 0), (bpt, 0.0), (bpt + 0.08, 0.12), (e - 0.12, 0.6), (e, 1.0), (o, 0.55), (o + 0.45, 0), (T, 0)],
-                bw=0.65, seed=2004, corr=0.55, tone=([(0, 90), (e, 150), (T, 60)], 0.22))
+                bw=0.65, seed=2004, corr=0.7, tone=([(0, 90), (e, 150), (T, 60)], 0.22))
     out += widen(dw, np.interp(t, [bpt, e, o], [0.8, 1.4, 1.4])) * 1.5
     out *= (1 - 0.65 * np.exp(-0.5 * ((t - (o - 0.03)) / 0.022) ** 2))[:, None]      # pre-snap suck
     m = ns(0.7)
@@ -2163,7 +2178,7 @@ def sfx_wipe(B):
     snap += impact(r, 360, 180, 0.05, 3000, body=0.7, noise=0.5, click_amt=0.6, dur=0.7) * 0.6
     snap += sub_drop(0.7, 120, 60, 0.03, 0.09, 1.5, harm=0.4) * 0.4
     put(out, snap * 0.9, o)
-    return out, s0
+    return glue(out, 2.2), s0
 
 
 # =============================================================================================
@@ -2171,8 +2186,8 @@ def sfx_wipe(B):
 # =============================================================================================
 # max momentary loudness targets (internal scale: voice integrated = -20 LUFS, master adds ~+6 dB)
 LV = dict(claude=-28, eraser=-21, studio=-18, studio_tone=-54, suit_bed=-27, suit_hit=-22, antic=-28,
-          fire_ignite=-20, fire_bed=-27, ice_form=-20, ice_bed=-30, converge=-22, fusion=-24, charge=-20,
-          boom=-11, portal_hit=-20, vortex=-29, suck=-21, close=-18, tunnel=-23, tunnel_hits=-22, exit=-20,
+          fire_ignite=-20, fire_bed=-27, ice_form=-17, ice_bed=-30, converge=-19, fusion=-24, charge=-20,
+          boom=-5.4, portal_hit=-20, vortex=-26, suck=-21, close=-18, tunnel=-23, tunnel_hits=-22, exit=-20,
           arrive=-23, space=-36, bh_form=-18, bh_bed=-30, strange_ign=-24, strange=-25, wipe=-16)
 
 
@@ -2663,13 +2678,14 @@ def voice_keys(voice, vad):
                 vmask=maximum_filter1d(vs, 15))
 
 
-def duck(bg, K, depth, pres_dyn, tgt_bb, tgt_sp, bed=False, protect=None, iters=3):
+def duck(bg, K, depth, pres_dyn, tgt_bb, tgt_sp, bed=False, protect=None, iters=3, w_lo=(0.45, 0.8), cap=None):
     """4-band side-chain ducking of bg under the voice.
     depth: static reduction per band (dB) at full voice activity; pres_dyn: extra 1-4 kHz reduction
     keyed on the voice's own presence envelope (dynamic EQ); adaptive unmasking keeps the voice
     >= tgt_sp dB over bg in the speech band (250-4500 Hz) and >= tgt_bb dB broadband (K-weighted,
     200 ms). bed=True: 120 ms attack / 600 ms release, low-band adaptive cut capped at 6 dB.
-    protect: (4, n_frames) multipliers 0..1 of the reduction (hit windows)."""
+    protect: (4, n_frames) multipliers 0..1 of the reduction (hit windows); cap: (4, n_frames) maximum
+    reduction (dB) per band; w_lo: low-band weights of the (speech-band, broadband) adaptive cuts."""
     hop = 0.01
     nf = len(K['vs'])
     act = K['act_bed'] if bed else K['act']
@@ -2679,8 +2695,8 @@ def duck(bg, K, depth, pres_dyn, tgt_bb, tgt_sp, bed=False, protect=None, iters=
         red[:, b] = depth[b] * act * P[b]
     red[:, 2] += pres_dyn * K['pres'] * P[2]
     bands = split4(bg)
-    w_sp = np.array([0.45, 1.0, 1.0, 0.3])
-    w_bb = np.array([0.8, 0.8, 0.8, 1.0])
+    w_sp = np.array([w_lo[0], 1.0, 1.0, 0.3])
+    w_bb = np.array([w_lo[1], 0.8, 0.8, 1.0])
     att, rel = (0.12, 0.6) if bed else (0.045, 0.28)
     la = (25, -8) if bed else (15, -5)
     adapt = np.zeros((nf, 4))
@@ -2703,6 +2719,8 @@ def duck(bg, K, depth, pres_dyn, tgt_bb, tgt_sp, bed=False, protect=None, iters=
             adapt[:, 0] = np.minimum(adapt[:, 0], 6.0)
     red += adapt
     red = np.minimum(red, np.array([15.0, 24.0, 24.0, 18.0])[None, :])
+    if cap is not None:
+        red = np.minimum(red, cap.T)
     out = sum(bands[b].astype(np.float64) * undb(-to_samples(red[:, b], 480))[:, None] for b in range(4))
     return out, red
 
@@ -2714,9 +2732,9 @@ def protect_windows(B, nf):
     wm = np.zeros(nf)
     wl = np.zeros(nf)
     ent = [(B['st_core'], 0.3, 0.12, None), (B['st_lamp'], 0.35, 0.10, None),
-           (B['su_ign'], 0.35, 0.10, None), (B['fire'], 0.5, 0.12, 0.3), (B['ice_lock'], 0.45, 0.12, None),
-           (B['fl1'], 0.3, 0.10, None), (B['po_open'], 0.4, 0.12, 0.3), (B['bh_ign'], 0.4, 0.10, 0.3),
-           (B['sg_ign'], 0.3, 0.10, None), (B['boom'], 0.85, 0.12, 0.9)]
+           (B['su_ign'], 0.35, 0.10, None), (B['fire'], 0.5, 0.12, None), (B['ice_lock'], 0.45, 0.12, None),
+           (B['fl1'], 0.3, 0.10, None), (B['po_open'], 0.4, 0.12, None), (B['bh_ign'], 0.4, 0.10, None),
+           (B['sg_ign'], 0.3, 0.10, None), (B['boom'], 0.85, 0.12, 0.9), (4.2, 0.6, 0.6, None)]   # + Claude bloom
     for k in ('clutter', 'flush', 'shower'):
         tr0, trd, b0, b1, pop = B['er_' + k]
         ent += [(tr0, 0.4, 0.12, None), (b0, 0.4, 0.12, None)]
@@ -2724,7 +2742,16 @@ def protect_windows(B, nf):
         wm = np.maximum(wm, s * env_pts(tf, [(0, 0), (th - 0.06, 0), (th - 0.02, 1), (th + hold, 1), (th + hold + 0.1, 0), (999, 0)]))
         lh = hold if lo_hold is None else lo_hold
         wl = np.maximum(wl, s * env_pts(tf, [(0, 0), (th - 0.06, 0), (th - 0.02, 1), (th + lh, 1), (th + lh + 0.25, 0), (999, 0)]))
-    return np.stack([1 - np.minimum(1, wl * 1.1), 1 - wm, 1 - wm * 0.9, 1 - wm * 0.8])
+    prot = np.stack([1 - np.minimum(1, wl * 1.1), 1 - wm, 1 - wm * 0.9, 1 - wm * 0.8])
+    # finale: after the transient the boom body is ducked at most ~10 dB under '-lizacao' (keep the hit
+    # big), the sub + rumble at most 3 dB
+    cap = np.full((4, nf), 99.0)
+    tb = B['boom']
+    wb = env_pts(tf, [(0, 0), (tb - 0.05, 0), (tb, 1), (33.1, 1), (33.4, 0), (999, 0)])
+    cap[0] = np.where(wb > 0, 3.0 + 96.0 * (1 - wb), 99.0)
+    for b, c in ((1, 10.0), (2, 14.0), (3, 10.0)):            # 1-4 kHz may duck more: '-li-za-' consonants
+        cap[b] = np.where(wb > 0, c + (99.0 - c) * (1 - wb), 99.0)
+    return prot, cap
 
 
 def tp_limit(x, ceil_db=-1.2, look_ms=1.5, rel_ms=80.0):
@@ -2807,14 +2834,14 @@ def build(report=True):
 
     vad_n = vad[:N // 480 + 1] if len(vad) >= N // 480 + 1 else np.pad(vad, (0, N // 480 + 1 - len(vad)))
     K = voice_keys(voice, vad_n)
-    prot = protect_windows(B, len(vad_n))
+    prot, cap = protect_windows(B, len(vad_n))
     musd, _ = duck(music, K, (5.0, 8.0, 9.0, 6.0), 4.0, 19.0, 21.0, bed=True)
     del music
     hit = mono_low(sx['hit'])
-    hitd, _ = duck(hit, K, (3.0, 5.0, 6.0, 3.0), 7.0, 12.5, 17.0, bed=False, protect=prot)
+    hitd, _ = duck(hit, K, (5.0, 5.0, 6.0, 3.0), 7.0, 13.5, 18.0, bed=False, protect=prot, w_lo=(0.9, 1.0), cap=cap)
     del hit
     bed = mono_low(sx['bed'])
-    bedd, _ = duck(bed, K, (4.0, 6.0, 7.0, 4.0), 5.0, 16.0, 19.0, bed=True)
+    bedd, _ = duck(bed, K, (5.0, 6.0, 7.0, 4.0), 5.0, 16.0, 19.0, bed=True, w_lo=(0.7, 0.9))
     del bed, sx
     sfxd = hitd + bedd
     bg = musd + sfxd
@@ -2822,8 +2849,21 @@ def build(report=True):
 
     mix = voice + bg
     g = undb(-14.0 - integrated(mix))
+
+    def boom_clip(y):
+        """Soft-clip the explosion (and the wipe burst): peaks are shaved by a tanh stage instead of
+        the limiter pumping the voice down."""
+        y = y.copy()
+        c = undb(-1.5) * 0.72
+        for t0, L in ((B['boom'], 0.95), (B['sg_rel'], 0.7)):
+            i0, i1 = ns(t0 - 0.01), ns(t0 + L)
+            seg = y[i0:i1]
+            k = np.arange(i1 - i0)
+            w = np.minimum(smooth01(k / ns(0.005)), smooth01((i1 - i0 - k) / ns(0.35)))[:, None]
+            y[i0:i1] = seg * (1 - w) + c * np.tanh(seg / c) * w
+        return y
     for it in range(4):
-        lim, gs = tp_limit(mix * g, -1.5)
+        lim, gs = tp_limit(boom_clip(mix * g), -1.5)
         li = integrated(lim)
         if abs(li + 14.0) < 0.1:
             break

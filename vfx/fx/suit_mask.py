@@ -215,6 +215,12 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
                 np.maximum(hb, hs_ * (1.0 - 0.9 * abs(o)), out=hb)
             hc = np.zeros_like(hands)
             _hand_hull(hc, p, rf, x0, y0)
+            if vn > 15.0:
+                # fast hand: the swept trail is a motion-blur streak -> soft edges (suit fades
+                # into the blurred skin), the hand's own hull stays crisp
+                sg = float(np.clip(vn * 0.06, 1.0, 7.0))
+                hb = np.maximum(cv2.GaussianBlur(hb, (0, 0), sg) * 1.15, hc)
+                hb = np.minimum(hb, 1.0)
             # flat cuff cut across the wrist (sleeve ends in a straight line, not a round cap)
             fdir = _forearm_dir(geo, i, side, p, sw)
             r_wr = float(np.clip(0.42 * np.linalg.norm(p[5] - p[17]), 0.07 * sw, 0.12 * sw)) * 1.05
@@ -341,7 +347,7 @@ def build(geo, i, crop, fg=None, alpha=None, dbg=None):
     arm = cv2.GaussianBlur(arm, (0, 0), 2.5)
     arm_thin = cv2.GaussianBlur(arm_thin, (0, 0), 2.5)
     prot = cv2.GaussianBlur(prot, (0, 0), 1.5)
-    hands = cv2.GaussianBlur(hands, (0, 0), 0.9)
+    hands = cv2.GaussianBlur(hands, (0, 0), 0.6)
     arm_ovr = arm * (1.0 - core_b) + arm_thin * core_b
     arm_ovr = np.maximum(arm_ovr, prot)
     head_eff = head * (1.0 - arm_ovr)

@@ -209,10 +209,12 @@ void main(){
   cRing = min(cRing, 1.0); cLip = min(cLip, 1.0); cAo = min(cAo, 1.0);
 
   // ---------------- shading (original skin luminance drives the form)
-  float shade = shadeIn;                          // ~1 = median body luminance
-  float shS = min(shade, 2.0);                    // sheen driver (no glitter from blown skin)
-  float lit = clamp(sqrt(shS), 0.0, 1.4);
-  float hiL = smoothstep(0.55, 1.9, shS);         // where light hits: texture shows there
+  // shadeIn = skin luminance / chest median.  os = the absolute-style shade the material was
+  // tuned with in the black studio (chest ~0.47), now exposure independent.
+  float os = 0.47 * shadeIn;
+  float osS = min(os, 2.0);                       // sheen driver: no glitter from blown skin
+  float lit = clamp(sqrt(osS) * 0.65, 0.0, 1.2);
+  float hiL = smoothstep(0.30, 1.10, osS);        // where light hits: texture shows there
 
   // ---------------- micro texture (rest-space anchored, analytically antialiased)
   vec2 qm = q * 36.0;
@@ -221,28 +223,28 @@ void main(){
   float cpp = max(fwidth(qm.x), fwidth(qm.y));    // cells per pixel
   float fadeM = (1.0 - smoothstep(0.10, 0.22, cpp)) * pv;
   float fw = max(fwidth(hd), 1e-4);
-  float hgroove = smoothstep(0.43 - fw, 0.46 + fw, hd) * fadeM;
+  float hgroove = smoothstep(0.405 - fw, 0.45 + fw, hd) * fadeM;
   float cellR = hash21(hc.zw);
   vec2 wv = q * 62.0;
   float wcpp = max(fwidth(wv.x), fwidth(wv.y));
   float weave = sin((wv.x + wv.y) * 3.14159) * sin((wv.x - wv.y) * 1.5708 + floor(wv.x + wv.y) * 1.5708);
   weave *= (1.0 - smoothstep(0.12, 0.28, wcpp)) * pv;   // [-1, 1] -> fades to 0 when aliased
 
-  vec3 albA = vec3(0.0105, 0.0112, 0.0128), albF = vec3(0.0125, 0.0128, 0.0138);
-  vec3 alb = mix(albF, albA * (1.0 - 0.18 * hgroove), armour);
-  vec3 col = alb * (0.25 + 0.95 * shade);
-  float sat = smoothstep(0.75, 2.0, shS);
+  vec3 albA = vec3(0.0098, 0.0107, 0.0127), albF = vec3(0.0118, 0.0123, 0.0137);
+  vec3 alb = mix(albF * (1.0 + 0.10 * weave * hiL), albA * (1.0 - hgroove * (0.24 + 0.26 * hiL)), armour);
+  vec3 col = alb * os;
+  float sat = pow(clamp(osS / 3.0, 0.0, 1.0), 1.9);
   vec3 Nm = N;
-  Nm.xy += (vec2(hash21(hc.zw + 3.1), hash21(hc.zw + 7.7)) - 0.5) * 0.08 * (1.0 - sat) * armour * fadeM;
+  Nm.xy += (vec2(hash21(hc.zw + 3.1), hash21(hc.zw + 7.7)) - 0.5) * 0.08 * (1.0 - min(sat * 2.0, 1.0)) * armour * fadeM;
   Nm = normalize(Nm);
   vec3 Lk = normalize(vec3(-0.30, -0.80, 0.55));
   vec3 H = normalize(Lk + vec3(0.0, 0.0, 1.0));
   float ndh = max(dot(Nm, H), 0.0);
-  float cellv = 1.0 + (cellR - 0.5) * 0.12 * fadeM;
-  float texF = 1.0 + 0.22 * weave * hiL;          // fabric weave only visible in the light
-  float sheenA = (sat * 0.060 + pow(ndh, 36.0) * 0.07 * lit) * cellv * (1.0 - 0.55 * hgroove * hiL);
-  float sheenF = (sat * 0.040 + pow(ndh, 12.0) * 0.016 * lit) * texF;
-  float fres = pow(1.0 - N.z, 3.0) * 0.018 * (0.6 + 0.4 * shS);
+  float cellv = 1.0 + (cellR - 0.5) * 0.12 * fadeM;     // +-6 %
+  float texF = 1.0 + 0.30 * weave * hiL;          // fabric weave only visible in the light
+  float sheenA = (sat * 0.064 + pow(ndh, 40.0) * 0.11 * lit) * cellv * (1.0 - hgroove * (0.25 + 0.4 * hiL));
+  float sheenF = sat * 0.034 * texF + pow(ndh, 12.0) * 0.022 * lit;
+  float fres = pow(1.0 - N.z, 3.0) * 0.020 * (0.6 + 0.4 * osS);
   col += vec3(0.86, 0.93, 1.05) * mix(sheenF, sheenA, armour) + vec3(0.55, 0.65, 0.85) * fres;
   col *= 1.0 - 0.80 * groove;
   col += vec3(0.80, 0.90, 1.0) * max(bevel, 0.0) * 0.020 * lit;
@@ -256,10 +258,11 @@ void main(){
   // ---------------- sheen sweep: a narrow specular glint travelling over the curved body
   float sweepE = 0.0;
   if (uSweep > -0.5){
-    float sq = (tu * 0.6 + tv * 0.8) - uSweep + 0.10 * (N.x * 0.6 + N.y * 0.8);   // bends with the form
-    float g = exp(-sq * sq / 0.0030);
+    // a glint travelling over the curved body: the line bends with the surface normal
+    float sq = (tu * 0.6 + tv * 0.8) - uSweep + 0.22 * (N.x * 0.6 + N.y * 0.8);
+    float g = exp(-sq * sq / 0.0016);
     float curv = 0.45 + 0.55 * pow(1.0 - N.z, 0.6) + 0.35 * armour;
-    col += vec3(0.75, 0.88, 1.0) * g * curv * 0.10 * (0.4 + lit);
+    col += vec3(0.75, 0.88, 1.0) * g * curv * 0.08 * (0.4 + lit);
     sweepE = g * curv * (0.25 + 0.5 * armour) * (0.5 + 0.5 * lit);
   }
 

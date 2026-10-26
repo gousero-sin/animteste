@@ -13,13 +13,11 @@ Owns the background from 0 s until the tunnel (EV['tunnel'][0]).
                  lights, edge despill + light wrap, person grade; the haze scatters every light.
 Render-order safe: every eraser whose fixed window contains t is built before any decision.
 """
-import sys
 import numpy as np
 import cv2
 from .. import config as C
 from .. import assets as A
 from .. import core
-from ..glfx import gl
 from .cleanup_util import sstep, sstep_f
 from .cleanup_eraser import Eraser
 from .cleanup_shatter import Shatter, front_R, ORIGIN
@@ -378,33 +376,9 @@ class FX(core.Effect):
         f = cv2.resize(f.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
         S.fg = S.fg * f[..., None]
 
-    _warned = False
-
     def _scene_lights(self, S):
-        """All lights of all modules this frame (the compositor keeps them in a local list;
-        read it from the caller frame if S.lights was not filled). Read-only, optional."""
+        """All lights of all modules this frame (filled by the compositor). Read-only."""
         L = list(getattr(S, 'lights', None) or [])
-        if not L:
-            found = False
-            try:
-                fr = sys._getframe(2)
-                for _ in range(4):
-                    if fr is None:
-                        break
-                    cand = fr.f_locals.get('lights')
-                    if isinstance(cand, list) and fr.f_locals.get('S') is S:
-                        L = list(cand)
-                        found = True
-                        break
-                    fr = fr.f_back
-            except Exception:
-                L = []
-            if not found and not FX._warned:
-                FX._warned = True
-                print('[cleanup] could not read the scene light list (S.lights empty, stack read '
-                      'failed): studio haze/dust react to cleanup lights only', file=sys.stderr)
-            if found:
-                return L
         if not L:
             L = [core.Light(**d) for d in S.meta.get('cleanup_lights', [])]
         return L

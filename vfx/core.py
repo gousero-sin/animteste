@@ -172,7 +172,13 @@ def warp_person(S, map_x, map_y):
 
 # ---------------------------------------------------------------- compositor
 def _relight(S, lights):
-    """Diffuse + rim relighting of the person from 2D point lights (computed at 1/4 res)."""
+    """Diffuse + rim relighting of the person from 2D point lights.
+
+    Diffuse wash and background bounce are smooth, so they are evaluated at 1/4 res. The rim
+    is a crisp band (~4-5 px) just inside the opaque part of the matte, evaluated at 1/2 res,
+    and is only partly albedo-scaled so dark hair / the black suit still catch a highlight
+    without turning into a flat coloured cap. Background bounce falls off with the square of
+    the usual falloff so strong lights do not lift a black environment far away from them."""
     if not lights:
         return
     q = 4
@@ -180,33 +186,47 @@ def _relight(S, lights):
     X, Y = grid(h, w)
     X = X * q + q / 2
     Y = Y * q + q / 2
-    a_s = cv2.resize(S.alpha, (w, h), interpolation=cv2.INTER_AREA)
-    a_b = cv2.GaussianBlur(a_s, (0, 0), 3.0)
-    gx = cv2.Sobel(a_b, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(a_b, cv2.CV_32F, 0, 1, ksize=3)
-    gm = np.sqrt(gx * gx + gy * gy) + 1e-6
-    nx, ny = -gx / gm, -gy / gm                       # outward normal of the silhouette
-    edge = np.clip(gm * 6.0, 0, 1) * np.clip(a_b * 2.2, 0, 1)
-    # inner falloff so rim spreads a little into the body
-    inner = cv2.GaussianBlur(edge, (0, 0), 2.0)
     diff = np.zeros((h, w, 3), np.float32)
-    rim = np.zeros((h, w, 3), np.float32)
     bgl = np.zeros((h, w, 3), np.float32)
+    rim_lights = []
     for L in lights:
-        dx, dy = L['pos'][0] - X, L['pos'][1] - Y
-        d = np.sqrt(dx * dx + dy * dy) + 1e-3
-        fall = L['intensity'] / (1.0 + (d / L['radius']) ** 2)
-        col = L['color'][None, None, :]
-        if L['diffuse'] > 0:
-            diff += (fall * L['diffuse'])[..., None] * col
+        if L['diffuse'] > 0 or L['bg'] > 0:
+            dx, dy = L['pos'][0] - X, L['pos'][1] - Y
+            u = (dx * dx + dy * dy) / (L['radius'] ** 2)
+            fall = L['intensity'] / (1.0 + u)
+            col = L['color'][None, None, :]
+            if L['diffuse'] > 0:
+                diff += (fall * L['diffuse'])[..., None] * col
+            if L['bg'] > 0:
+                bgl += (fall * L['bg'] / (1.0 + u))[..., None] * col
         if L['rim'] > 0:
-            facing = np.clip((nx * dx + ny * dy) / d, 0, 1) ** 1.5
-            rim += (fall * L['rim'] * facing * inner)[..., None] * col
-        if L['bg'] > 0:
-            bgl += (fall * L['bg'])[..., None] * col
+            rim_lights.append(L)
     diff = cv2.resize(diff, (W, H), interpolation=cv2.INTER_LINEAR)
-    rim = cv2.resize(rim, (W, H), interpolation=cv2.INTER_LINEAR)
-    S.fg = S.fg * (1.0 + diff) + rim * 0.6 + diff * 0.04
+    S.fg = S.fg * (1.0 + diff) + diff * 0.04
+    if rim_lights:
+        q2 = 2
+        h2, w2 = H // q2, W // q2
+        X2, Y2 = grid(h2, w2)
+        X2 = X2 * q2 + q2 / 2
+        Y2 = Y2 * q2 + q2 / 2
+        a_s = cv2.resize(S.alpha, (w2, h2), interpolation=cv2.INTER_AREA)
+        a_b = cv2.GaussianBlur(a_s, (0, 0), 1.2)
+        gx = cv2.Sobel(a_b, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(a_b, cv2.CV_32F, 0, 1, ksize=3)
+        gm = np.sqrt(gx * gx + gy * gy) + 1e-6
+        nx, ny = -gx / gm, -gy / gm                   # outward normal of the silhouette
+        band = np.clip(gm * 1.5, 0, 1) * np.clip((a_b - 0.35) * 3.0, 0, 1)
+        band = cv2.GaussianBlur(band, (0, 0), 1.0)
+        rim = np.zeros((h2, w2, 3), np.float32)
+        for L in rim_lights:
+            dx, dy = L['pos'][0] - X2, L['pos'][1] - Y2
+            d = np.sqrt(dx * dx + dy * dy) + 1e-3
+            fall = L['intensity'] / (1.0 + (d / L['radius']) ** 2)
+            facing = np.clip((nx * dx + ny * dy) / d, 0, 1) ** 1.5
+            rim += (fall * L['rim'] * facing * band)[..., None] * L['color'][None, None, :]
+        rim = cv2.resize(rim, (W, H), interpolation=cv2.INTER_LINEAR)
+        surf = 0.45 + 0.55 * np.clip(S.fg * 3.0, 0, 1)
+        S.fg = S.fg + rim * surf * 0.9
     if bgl.any():
         S.bg += cv2.resize(bgl, (W, H), interpolation=cv2.INTER_LINEAR) * (1.0 - S.alpha[..., None])
 
@@ -239,7 +259,6 @@ def _bloom(img, strength):
     acc = np.zeros_like(img)
     cur = bright
     weights = (0.30, 0.35, 0.40, 0.45, 0.50)
-    sizes = []
     for k, wgt in enumerate(weights):
         hh, ww = cur.shape[0] // 2, cur.shape[1] // 2
         cur = cv2.resize(cur, (ww, hh), interpolation=cv2.INTER_AREA)
@@ -285,6 +304,7 @@ class Compositor:
         lights = []
         for e in fx:
             lights += e.lights(S) or []
+        S.lights = lights          # merged list, readable by behind()/front()/post() hooks
         _grade_person(S)
         _relight(S, lights)
         img = S.bg.copy()

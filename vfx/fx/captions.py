@@ -25,12 +25,16 @@ Design
 * Readability on the white tiles AND on black/space: tight halo + two-scale soft drop shadow +
   a crisp dark stroke on bright backgrounds, all scaled by the background luminance under the
   text; glow fades out on bright backgrounds.
+* Head: the crown is measured on the person matte (skull above the chin minus arms/hands), so it
+  stays right when he turns into profile; the face-mesh estimate only fills gaps.
 * Layout solver (precomputed per phrase, cached): for every frame it scores (zoom, lift, shift)
   states by per-letter visibility, separating the head (allowed - and rewarded - to cover the
-  lower band) from arms/hands and the predicted Doctor Strange sling ring (not allowed, hard
-  minimum for keyword letters), plus a penalty when a fragile glyph (E, O, U, R...) sits on the
-  head apex. A Viterbi pass with look-ahead picks a temporally coherent path, which is then
-  smoothed -> the line visibly dodges, starting before the hand arrives.
+  lower band) from arms/hands, the predicted fire/ice orbs and the predicted Doctor Strange
+  sling ring (not allowed, hard minimum for keyword letters), plus a penalty when a fragile
+  glyph (E, O, U, R...) sits on the head apex. A speed-limited Viterbi pass with look-ahead
+  picks a temporally coherent path (big moves must travel through - and pay for - the states in
+  between, so the line goes around a hand, never through it), then it is smoothed -> the line
+  visibly dodges, starting before the hand arrives.
 * Tunnel (no person): captions centred, words fly out of the vanishing point and zoom past the
   camera.  "E ME SUGA": the phrase is sucked up into the ceiling portal.
 * Pure function of the frame index: head track, timings and layouts are precomputed for all

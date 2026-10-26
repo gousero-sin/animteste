@@ -287,9 +287,9 @@ class Geometry:
             b = k + 1 if k + 1 < N and known[k + 1] else k
             if b > a:
                 vel[k] = (out[b] - out[a]) / (b - a)
-        # run-end extrapolation (motion-blurred exits / entries): opaque for 2 frames, then
-        # a quick fade (stuck extrapolations would otherwise cut holes in the torso)
-        EXW = (1.0, 1.0, 0.7, 0.35)
+        # run-end extrapolation (motion-blurred exits / entries): opaque for 3 frames, then
+        # nothing (no translucent ghosts; a stuck extrapolation would otherwise cut holes)
+        EXW = (1.0, 1.0, 1.0)
         for base, dr in ext:
             k2 = base - dr * 2
             if 0 <= k2 < N and known[k2] and kind[k2] in (1, 2):

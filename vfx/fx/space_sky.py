@@ -1,7 +1,10 @@
 """Static deep-space layers for the `space` module (generated once, cached).
 
-far canvas  : base gradient + galactic band + emission nebula + dust + distant galaxies +
-              ~11k faint stars, linear RGB, frame + margin (drifts slowly).
+far canvas  : base gradient + galactic band + emission nebula + dust + distant galaxies,
+              linear RGB, frame + margin (drifts slowly). NO stars: baked stars resampled with a
+              drifting bilinear warp all blur together at half-pixel phases (coherent "breathing"),
+              so the ~48k faint far stars are a separate catalog splatted per frame at exact float
+              positions (energy-normalised gaussian footprints, see space.py).
 near canvas : sharper nebula wisps (rgb emission) + foreground dust (alpha = absorption),
               drifts faster (parallax).
 Star catalogs for the per-frame twinkling layers are generated from fixed seeds.
@@ -14,8 +17,8 @@ from .. import config as C
 CACHE = os.path.join(C.DATA, 'cache', 'space')
 W, H = C.W, C.H
 
-FAR_M = (140, 150)        # canvas margin (x, y) around the frame
-NEAR_M = (260, 170)
+FAR_M = (180, 260)        # canvas margin (x, y) around the frame (covers the arrival zoom)
+NEAR_M = (290, 270)
 
 # galactic band: line through A with direction DIR (frame px); leads from lower-left (behind
 # him) up to the black hole on the upper right.
@@ -27,6 +30,7 @@ NEB_FAR = r'''
 uniform vec2 uOff;
 uniform vec2 uBandA; uniform vec2 uBandN;
 uniform vec2 uGal;     // main galaxy centre (frame px)
+uniform vec2 uBH;      // black hole centre (frame px): darker pocket so the hole reads
 float bandD(vec2 p){ return dot(p - uBandA, uBandN); }
 vec3 galaxy(vec2 p, vec2 c, float R, float incl, float pa, float seed, float bright){
     vec2 g = rot2(pa) * (p - c);
@@ -64,21 +68,36 @@ void main(){
     float b1 = 1.0 - abs(fbm3(Q * 1.35 + vec3(4.0, 1.0, 2.0), 6));
     float dens = pres * pow(smoothstep(0.30, 0.86, c1), 1.5) * (0.5 + 0.7 * b1);
     float cm = fbm3(vec3(q * 1.3 + 0.3 * w, 11.0), 4) * 0.5 + 0.5;
-    vec3 ha = vec3(1.0, 0.13, 0.40);
-    vec3 o3 = vec3(0.06, 0.72, 0.85);
-    vec3 bl = vec3(0.20, 0.30, 1.0);
-    vec3 neb = mix(o3, ha, smoothstep(0.40, 0.62, cm));
-    neb = mix(neb, vec3(0.55, 0.95, 1.0), smoothstep(0.8, 1.2, dens) * 0.45);
-    vec3 col = neb * pow(dens, 1.9) * 0.20;
-    col += bl * pow(lo, 3.0) * 0.010 * (0.3 + bandW);
+    // luminous star-forming core behind him (separation light) feeding the band
+    vec2 kc = (p - vec2(330.0, 800.0)) / vec2(430.0, 360.0);
+    float core = exp(-dot(kc, kc) * 1.6);
+    dens *= 1.0 + 0.85 * core;
+    dens += core * 0.22 * smoothstep(0.25, 0.8, c1) * (0.6 + 0.6 * b1);
+    // keep a darker pocket around the black hole so the hole and its lensing read cleanly
+    vec2 bc = (p - uBH) / vec2(330.0, 290.0);
+    dens *= 0.22 + 0.78 * smoothstep(0.35, 1.45, length(bc));
+    // soften the nebula right behind his head / pointing arm (soft matte edges live there):
+    // keeps a moderate separation glow, no high-contrast knot at the hair fringe
+    vec2 hc = (p - vec2(520.0, 900.0)) / vec2(300.0, 210.0);
+    dens *= 0.50 + 0.50 * smoothstep(0.25, 1.25, length(hc));
+    vec2 lc = (p - vec2(90.0, 940.0)) / vec2(260.0, 170.0);
+    dens *= 0.35 + 0.65 * smoothstep(0.3, 1.2, length(lc));
+    vec3 ha = vec3(1.0, 0.10, 0.45);
+    vec3 o3 = vec3(0.02, 0.70, 0.90);
+    vec3 bl = vec3(0.20, 0.28, 1.0);
+    float hm = smoothstep(0.42, 0.60, cm);
+    vec3 neb = mix(o3, ha, hm);
+    neb = mix(neb, vec3(0.62, 0.95, 1.0), smoothstep(0.75, 1.3, dens) * 0.3);   // hot OIII cores
+    vec3 col = neb * pow(dens, 2.1) * 0.24;
+    col += bl * pow(lo, 3.0) * 0.012 * (0.3 + bandW);
     float fil = ridged3(vec3(q * 3.6 + 0.6 * w, 9.0), 6);
-    col += mix(o3, ha, smoothstep(0.40, 0.62, cm)) * pow(fil, 8.0) * pres * 0.06;
-    col += vec3(0.95, 0.88, 0.78) * bandC * 0.030 * (0.5 + 0.7 * (fbm3(vec3(q * 7.0, 21.0), 4) * 0.5 + 0.5));
+    col += mix(o3, ha, hm) * pow(fil, 11.0) * pres * dens * 0.10;
+    col += vec3(0.95, 0.88, 0.80) * bandC * 0.018 * (0.5 + 0.7 * (fbm3(vec3(q * 7.0, 21.0), 4) * 0.5 + 0.5));
     float dn = fbm3(vec3(q * 2.4 + 0.5 * w.yx, 13.0), 7) * 0.5 + 0.5;
     float dust = smoothstep(0.53, 0.66, dn) * (0.30 + 0.70 * bandW);
     float rim = smoothstep(0.47, 0.53, dn) * (1.0 - smoothstep(0.53, 0.58, dn));
     col *= 1.0 - 0.92 * dust;
-    col += vec3(1.0, 0.62, 0.45) * rim * dens * 0.035;
+    col += vec3(1.0, 0.55, 0.40) * rim * pow(dens, 1.5) * 0.06;
     vec3 base = mix(vec3(0.0012, 0.0013, 0.0034), vec3(0.003, 0.0028, 0.007), bandW);
     col += base;
     col += galaxy(p, uGal, 95.0, 1.08, 0.62, 2.0, 0.42) * (1.0 - 0.6 * dust);
@@ -185,9 +204,8 @@ def mid_star_catalog(seed=202, n=520):
 
 # hero stars (unlensed, with diffraction spikes): hand-placed away from the black hole and
 # from his face; (x, y, flux, temperature)
-HERO = [(132.0, 118.0, 5.5, 11000), (470.0, 300.0, 3.2, 4200), (1010.0, 95.0, 3.8, 15000),
-        (60.0, 1010.0, 3.0, 7000), (300.0, 560.0, 2.4, 9000), (1040.0, 1130.0, 3.2, 5200),
-        (585.0, 470.0, 2.0, 18000), (205.0, 1290.0, 2.6, 13000), (1000.0, 300.0, 2.2, 6000)]
+HERO = [(132.0, 118.0, 4.5, 11000), (470.0, 300.0, 2.4, 4200), (1010.0, 95.0, 3.0, 15000),
+        (60.0, 1010.0, 2.2, 7000), (1040.0, 1150.0, 2.4, 5200), (590.0, 470.0, 1.6, 18000)]
 
 
 def _render_stars(size, offset, xy, flux, col, sig):
@@ -199,20 +217,25 @@ def _render_stars(size, offset, xy, flux, col, sig):
     return img[..., :3]
 
 
-def build_far(gal=(190.0, 300.0)):
+def build_far(bh, gal=(190.0, 300.0)):
+    """Star-free far canvas (nebula, band, dust, galaxies) + the far-star catalog with a
+    per-star dust attenuation sampled from the same dust field."""
     from ..glfx import gl
     cw, ch = W + 2 * FAR_M[0], H + 2 * FAR_M[1]
     prog = gl.program(NEB_FAR)
     off = (-FAR_M[0], -FAR_M[1])
     img = gl.render(prog, (cw, ch), uniforms={'uOff': off, 'uBandA': tuple(BAND_A), 'uBandN': tuple(BAND_N),
-                                              'uGal': gal})[..., :3]
+                                              'uGal': gal, 'uBH': tuple(float(v) for v in bh)})[..., :3]
     xy, flux, col, sig = faint_star_catalog()
-    # stars are dimmed where dust is thick: sample the nebula luminance as a proxy is not
-    # possible (dust is multiplicative), so render stars then apply a dust-only pass
-    stars = _render_stars((cw, ch), off, xy, flux, col, sig)
     dust = _dust_mask((cw, ch), off)
-    img = img + stars * (1.0 - 0.9 * dust[..., None])
-    return img.astype(np.float32)
+    cx = np.clip(np.round(xy[:, 0] + FAR_M[0]).astype(int), 0, cw - 1)
+    cy = np.clip(np.round(xy[:, 1] + FAR_M[1]).astype(int), 0, ch - 1)
+    att = 1.0 - 0.9 * dust[cy, cx]
+    # sprite peak = flux at sigma = sig -> integrated energy = flux * 2 pi sig^2
+    energy = flux * att * 2.0 * np.pi * sig ** 2
+    stars = dict(xy=xy.astype(np.float32), rgb=(col * energy[:, None]).astype(np.float32),
+                 sig=np.maximum(sig, 0.62).astype(np.float32))
+    return img.astype(np.float32), stars
 
 
 DUST_ONLY = r'''
@@ -245,18 +268,27 @@ def build_near():
     return img.astype(np.float32)
 
 
-def load_layers(version=5, verbose=True):
+def load_layers(bh=(846.0, 650.0), version=10, verbose=True):
+    """-> far canvas (h, w, 3), near canvas (h, w, 4: rgb emission + dust alpha), far-star dict."""
     os.makedirs(CACHE, exist_ok=True)
-    pf = os.path.join(CACHE, f'far_v{version}.npy')
+    tag = f'v{version}_{int(bh[0])}_{int(bh[1])}'
+    pf = os.path.join(CACHE, f'far_{tag}.npy')
+    ps = os.path.join(CACHE, f'farstars_{tag}.npz')
     pn = os.path.join(CACHE, f'near_v{version}.npy')
-    if os.path.exists(pf) and os.path.exists(pn):
-        return np.load(pf).astype(np.float32), np.load(pn).astype(np.float32)
-    if verbose:
-        print('[space] building nebula layers ...', flush=True)
-    far = build_far()
-    near = build_near()
-    np.save(pf + '.tmp.npy', far.astype(np.float16))
-    os.replace(pf + '.tmp.npy', pf)
-    np.save(pn + '.tmp.npy', near.astype(np.float16))
-    os.replace(pn + '.tmp.npy', pn)
-    return far, near
+    if not (os.path.exists(pf) and os.path.exists(ps)):
+        if verbose:
+            print('[space] building far nebula layer ...', flush=True)
+        far, stars = build_far(bh)
+        np.save(pf + '.tmp.npy', far.astype(np.float16))
+        np.savez(ps + '.tmp.npz', **stars)
+        os.replace(ps + '.tmp.npz', ps)
+        os.replace(pf + '.tmp.npy', pf)
+    if not os.path.exists(pn):
+        if verbose:
+            print('[space] building near layer ...', flush=True)
+        near = build_near()
+        np.save(pn + '.tmp.npy', near.astype(np.float16))
+        os.replace(pn + '.tmp.npy', pn)
+    z = np.load(ps)
+    stars = {k: z[k] for k in z.files}
+    return np.load(pf).astype(np.float32), np.load(pn).astype(np.float32), stars

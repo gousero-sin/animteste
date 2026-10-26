@@ -63,6 +63,15 @@ def _rolling_median(x, valid, half):
     return out
 
 
+def _runs(mask):
+    """Inclusive (start, end) index pairs of the True runs of a 1-D bool array."""
+    m = np.r_[False, np.asarray(mask, bool), False]
+    d = np.diff(m.astype(np.int8))
+    st = np.where(d == 1)[0]
+    en = np.where(d == -1)[0] - 1
+    return list(zip(st.tolist(), en.tolist()))
+
+
 class Geometry:
     """Cleaned, temporally smoothed body geometry for every frame."""
 
@@ -119,6 +128,10 @@ class Geometry:
                 wsum += w
             syn[i] = (acc / wsum).astype(np.float32)
         self.oval = _gauss_smooth_series(syn, np.ones(N, bool), 1.2)
+        # nose tip relative to the oval centre (for yaw); synthesised frames use the pose nose
+        nose = face[:, 1].copy()
+        nose[~valid] = self.pose[~valid, 0, :2] - head_c[~valid] + syn[~valid].mean(1)
+        self.nose = _gauss_smooth_series(nose, np.ones(N, bool), 1.2)
         # confidence (1 = good face mesh around this time)
         self.face_conf = np.clip(_smooth1d(valid.astype(np.float32), 3.0), 0, 1)
         # face size reference: interpolated over valid frames (follows lean-ins), smoothed
@@ -128,34 +141,187 @@ class Geometry:
 
         # ---------------- pose smoothing (light) -----------------------------------------
         self.pose_s = _gauss_smooth_series(P[:, :, :2], np.ones(N, bool), 1.0)
+        self.vis_s = _gauss_smooth_series(P[:, :, 3], np.ones(N, bool), 1.5)
+        shd = _smooth1d(np.linalg.norm(self.pose_s[:, 11] - self.pose_s[:, 12], axis=1), 2.0)
+        self.sw = np.maximum(shd, 1.45 * self.fh_ref).astype(np.float32)
 
         # ---------------- hands -------------------------------------------------------------
-        # Non-detected landmarks in the track are extrapolations that often stay stuck on the
-        # chest after the hand has left: trust them only close (in time) to a real detection.
-        self.hand = {}
+        # The raw track gap-fills missing hands by interpolating between detections, including
+        # false ones (forearm detected as a hand, mirrored hands) - garbage that cuts holes in the
+        # suit.  We re-derive everything from validated detections only:
+        #   1. per-frame / per-run validation by temporal self-consistency (size, axis angle)
+        #   2. gaps between valid detections: linear interpolation when plausible
+        #   3. run ends: constant-velocity extrapolation for a few frames (motion-blurred exits)
+        #   4. pose fallback only when the pose hand is clearly trustworthy
+        self.hand, self.hand_w, self.hand_vel, self.hand_kind, self.det_ok = {}, {}, {}, {}, {}
         self.hand_conf = {}
-        self.hand_w = {}
-        idx = np.arange(N)
+        self.fb_ok = {}
         for s in ('R', 'L'):
-            h = T['hand' + s].astype(np.float32)
-            have = ~np.isnan(h[:, 0, 0])
-            det = T['hand%s_det' % s].astype(bool)
-            hs = h.copy()
-            hs[~have] = 0
-            hs = _gauss_smooth_series(hs[:, :, :2], have, 0.8)
-            hs[~have] = np.nan
-            self.hand[s] = hs
-            self.hand_conf[s] = np.clip(_smooth1d(det.astype(np.float32), 3.0), 0, 1)
-            didx = np.where(det)[0]
-            if len(didx):
-                k = np.clip(np.searchsorted(didx, idx), 1, len(didx) - 1) if len(didx) > 1 else np.zeros(N, int)
-                dist = np.minimum(np.abs(idx - didx[k]), np.abs(idx - didx[np.maximum(k - 1, 0)]))
-            else:
-                dist = np.full(N, 999)
-            w = np.exp(-np.maximum(dist - 1, 0) / 2.5).astype(np.float32)
-            w[~have] = 0
-            self.hand_w[s] = w
+            self._build_hand(T, s)
         self.have_hand = {s: self.hand_w[s] > 0.02 for s in ('R', 'L')}
+
+    def _build_hand(self, T, s):
+        N = self.N
+        P = self.pose
+        sw = self.sw
+        h = T['hand' + s][:, :, :2].astype(np.float32)
+        det = T['hand%s_det' % s].astype(bool) & ~np.isnan(h[:, 0, 0])
+        hn = np.nan_to_num(h)
+        L12 = np.linalg.norm(hn[:, 12] - hn[:, 0], axis=1)
+        L9 = np.linalg.norm(hn[:, 9] - hn[:, 0], axis=1)
+        PW = np.linalg.norm(hn[:, 5] - hn[:, 17], axis=1)
+        size = np.maximum.reduce([L12, 1.9 * L9, 1.6 * PW])
+        ax = hn[:, 9] - hn[:, 0]
+        ang = np.arctan2(ax[:, 1], ax[:, 0])
+
+        def adiff(a, b):
+            return np.abs((a - b + np.pi) % (2 * np.pi) - np.pi)
+
+        # (a) degenerate frames
+        det &= size > 0.10 * sw
+        # (b) frames inconsistent with their own run (size collapse / axis flip)
+        for a, b in _runs(det):
+            if b - a + 1 >= 3:
+                med = np.median(size[a:b + 1])
+                for k in range(a, b + 1):
+                    lo, hi = max(a, k - 3), min(b, k + 3)
+                    am = np.median(ang[lo:hi + 1])
+                    if size[k] < 0.5 * med or adiff(ang[k], am) > np.radians(70):
+                        det[k] = False
+        # (c) short runs must agree with the long ("anchor") runs around them
+        runs = _runs(det)
+        anchors = [r for r in runs if r[1] - r[0] + 1 >= 5]
+        for a, b in runs:
+            n = b - a + 1
+            if n >= 5:
+                continue
+            ra = np.median(ang[a:b + 1])
+            rs = np.median(size[a:b + 1])
+            votes = []
+            prev = [r for r in anchors if r[1] < a and a - r[1] <= 45]
+            nxt = [r for r in anchors if r[0] > b and r[0] - b <= 45]
+            if prev:
+                e = prev[-1][1]
+                votes.append(adiff(ra, ang[e]) < np.radians(100) and 0.4 < rs / size[e] < 2.3)
+            if nxt:
+                e = nxt[0][0]
+                votes.append(adiff(ra, ang[e]) < np.radians(100) and 0.4 < rs / size[e] < 2.3)
+            if votes:
+                ok = any(votes)
+            else:
+                # isolated short run: keep only when it sits on a confident pose wrist
+                wi = POSE_ARM[s][2]
+                dpw = np.linalg.norm(hn[a:b + 1, 0] - P[a:b + 1, wi, :2], axis=1) / sw[a:b + 1]
+                ok = bool(np.median(P[a:b + 1, wi, 3]) > 0.6 and np.median(dpw) < 0.6)
+            if not ok:
+                det[a:b + 1] = False
+        self.det_ok[s] = det.copy()
+        # smoothing inside runs (valid samples only)
+        hs = h.copy()
+        hs[~det] = 0
+        hs = _gauss_smooth_series(hs, det, 0.8)
+        out = np.full((N, 21, 2), np.nan, np.float32)
+        out[det] = hs[det]
+        w = np.zeros(N, np.float32)
+        w[det] = 1.0
+        kind = np.zeros(N, np.int8)              # 0 none, 1 det, 2 interp, 3 extrap, 4 pose
+        kind[det] = 1
+        vel = np.zeros((N, 21, 2), np.float32)
+        didx = np.where(det)[0]
+        # gaps
+        ext = []                                  # (frame, base frame, direction)
+        for j in range(len(didx) - 1):
+            a, b = didx[j], didx[j + 1]
+            gap = b - a - 1
+            if gap <= 0:
+                continue
+            disp = np.linalg.norm(out[b, 0] - out[a, 0]) / sw[a]
+            if (gap <= 24 and disp <= 0.7) or (gap <= 45 and disp <= 0.35):
+                # pose-guided interpolation: the deviation of the pose palm from its own
+                # straight-line path is added (hands circling / waving between detections)
+                wi = POSE_ARM[s][2]
+                pp = self.pose_s[:, list(POSE_HAND[s])].mean(1)
+                for k in range(a + 1, b):
+                    u = (k - a) / (b - a)
+                    out[k] = out[a] * (1 - u) + out[b] * u
+                    if gap > 4:
+                        dev = pp[k] - (pp[a] * (1 - u) + pp[b] * u)
+                        dn = float(np.linalg.norm(dev))
+                        lim = 0.35 * sw[k]
+                        if dn > lim:
+                            dev = dev * (lim / dn)
+                        beta = float(np.clip((self.vis_s[k, wi] - 0.45) / 0.2, 0, 1)) * min(1.0, 4.0 * min(u, 1 - u))
+                        out[k] = out[k] + beta * dev
+                    w[k] = 1.0
+                    kind[k] = 2
+            else:
+                ext.append((a, +1))
+                ext.append((b, -1))
+        if len(didx):
+            ext.append((didx[0], -1))
+            ext.append((didx[-1], +1))
+        # velocities (px / frame) for known frames
+        known = w > 0
+        for k in np.where(known)[0]:
+            a = k - 1 if k > 0 and known[k - 1] else k
+            b = k + 1 if k + 1 < N and known[k + 1] else k
+            if b > a:
+                vel[k] = (out[b] - out[a]) / (b - a)
+        # run-end extrapolation (motion-blurred exits / entries): opaque for 2 frames, then
+        # a quick fade (stuck extrapolations would otherwise cut holes in the torso)
+        EXW = (1.0, 1.0, 0.7, 0.35)
+        for base, dr in ext:
+            k2 = base - dr * 2
+            if 0 <= k2 < N and known[k2] and kind[k2] in (1, 2):
+                v = (out[base] - out[k2]) / 2.0 * dr
+            elif 0 <= base - dr < N and known[base - dr]:
+                v = (out[base] - out[base - dr]) * dr
+            else:
+                v = np.zeros((21, 2), np.float32)
+            vmax = 0.35 * sw[base]
+            vn = float(np.linalg.norm(v[0]))
+            if vn > vmax:
+                v = v * (vmax / vn)
+            for k in range(1, len(EXW) + 1):
+                f = base + dr * k
+                if not (0 <= f < N) or kind[f] in (1, 2):
+                    break
+                wk = EXW[k - 1]
+                if wk <= w[f]:
+                    continue
+                out[f] = out[base] + v * (k * dr)
+                w[f] = wk
+                kind[f] = 3
+                vel[f] = v * dr
+        # pose fallback: strictly gated (hallucinated pose hands cut holes in the suit)
+        wi, ei, si = POSE_ARM[s][2], POSE_ARM[s][1], POSE_ARM[s][0]
+        ps = self.pose_s
+        pidx = list(POSE_HAND[s])
+        palm = ps[:, pidx].mean(1)
+        jump = np.zeros(N, np.float32)
+        jump[1:] = np.linalg.norm(palm[1:] - palm[:-1], axis=1)
+        jump = np.maximum(jump, np.r_[jump[1:], 0.0]) / sw
+        ua = np.linalg.norm(ps[:, ei] - ps[:, si], axis=1)
+        fa = np.linalg.norm(ps[:, wi] - ps[:, ei], axis=1)
+        idx = np.arange(N)
+        if len(didx):
+            kk = np.clip(np.searchsorted(didx, idx), 0, len(didx) - 1)
+            kp = np.clip(kk - 1, 0, len(didx) - 1)
+            near = np.where(np.abs(idx - didx[kk]) < np.abs(idx - didx[kp]), didx[kk], didx[kp])
+            dnear = np.abs(idx - near)
+            dwr = np.linalg.norm(ps[:, wi] - out[near, 0], axis=1) / sw
+        else:
+            dnear = np.full(N, 999)
+            dwr = np.full(N, 9.0)
+        fb = ((w < 0.5) & (self.vis_s[:, wi] >= 0.75) & (dnear <= 8) & (dwr <= 0.4)
+              & (fa > 0.4 * ua) & (fa < 1.3 * ua) & (jump < 0.25)
+              & (ps[:, wi, 0] > 0) & (ps[:, wi, 0] < C.W) & (ps[:, wi, 1] < C.H - 10))
+        self.fb_ok[s] = fb
+        self.hand[s] = out
+        self.hand_w[s] = w
+        self.hand_vel[s] = vel
+        self.hand_kind[s] = kind
+        self.hand_conf[s] = np.clip(_smooth1d(det.astype(np.float32), 3.0), 0, 1)
 
     # ------------------------------------------------------------------ queries
     def shoulders(self, i):
@@ -163,14 +329,27 @@ class Geometry:
         return p[12].copy(), p[11].copy()          # frame-left (R), frame-right (L)
 
     def arm(self, i, side):
-        """(shoulder, elbow, wrist) points; wrist from the hand landmarks when trusted."""
+        """(shoulder, elbow, wrist) points; wrist from the hand landmarks when the hand is
+        known AND plausibly attached to this arm (MediaPipe sometimes swaps handedness)."""
         p = self.pose_s[i]
         a, b, c = POSE_ARM[side]
         sh, el, wr = p[a].copy(), p[b].copy(), p[c].copy()
         w = float(self.hand_w[side][i])
-        if w > 0.02:
+        if w > 0.02 and self.hand_attached(i, side):
             wr = w * self.hand[side][i][0] + (1 - w) * wr
         return sh, el, wr
+
+    def hand_attached(self, i, side):
+        if self.hand_w[side][i] <= 0.02:
+            return False
+        p = self.pose_s[i]
+        a, b, c = POSE_ARM[side]
+        sw = float(self.sw[i])
+        hw = self.hand[side][i][0]
+        ua = max(float(np.linalg.norm(p[b] - p[a])), 0.45 * sw)
+        if self.vis_s[i, b] > 0.5:
+            return float(np.linalg.norm(hw - p[b])) < 1.6 * ua
+        return float(np.linalg.norm(hw - p[a])) < 2.6 * ua
 
     def face_frame(self, i):
         o = self.oval[i]
@@ -209,13 +388,20 @@ class Geometry:
         m = 0.07 + 0.10 * unc
         face = c + rel * (1 + m) - ey[None, :] * (fh * (0.055 + 0.04 * unc) * lo[:, None] ** 2)
         le, re = o[OV_LEFTEAR], o[OV_RIGHTEAR]
-        ears = []
+        # yaw from the nose tip: the far ear is hidden behind the head in 3/4 view
+        yaw_f = float(np.clip(np.dot(self.nose[i] - c, ex) / (0.5 * fw), -1, 1))
+        polys.append(cv2.convexHull(face.astype(np.float32)).reshape(-1, 2))
         for p, sgn in ((le, -1), (re, 1)):
-            q = p + sgn * ex * (0.12 * fw) + ey * 0.03 * fh
-            for a in np.linspace(0, 2 * np.pi, 10, endpoint=False):
-                ears.append(q + (np.cos(a) * ex * 0.13 * fh + np.sin(a) * ey * 0.17 * fh))
-        pts = np.concatenate([face, np.array(ears)], 0).astype(np.float32)
-        polys.append(cv2.convexHull(pts).reshape(-1, 2))
+            vis = float(np.clip(1.0 - (sgn * yaw_f - 0.12) / 0.30, 0.0, 1.0))
+            vis = max(vis, unc)
+            if vis < 0.05:
+                continue
+            q = p + sgn * ex * (0.12 * fw * vis) + ey * 0.03 * fh
+            ear = [q + (np.cos(a) * ex * 0.13 * fh * (0.4 + 0.6 * vis) + np.sin(a) * ey * 0.17 * fh)
+                   for a in np.linspace(0, 2 * np.pi, 14, endpoint=False)]
+            # bridge the ear to the face edge (temples / glasses arms)
+            ear += [p + ey * 0.12 * fh, p - ey * 0.10 * fh]
+            polys.append(cv2.convexHull(np.array(ear, np.float32)).reshape(-1, 2))
         # ---- skull ellipse
         P = self.pose_s[i]
         em = (P[7] + P[8]) * 0.5
@@ -254,16 +440,19 @@ class Geometry:
 
     def hand_shapes(self, i, side, sw):
         """Returns (kind, data) for the hand mask:
-           ('lm', (pts21, finger_radius, size)) or ('pose', (polygon, margin)) or None."""
+           ('lm', (pts21, finger_radius, size, weight, velocity)) or ('pose', (polygon, margin, w))
+           or None."""
         if self.have_hand[side][i]:
             h = self.hand[side][i]
             hs = float(np.linalg.norm(h[12] - h[0]))
             pw = float(np.linalg.norm(h[5] - h[17]))
             size = max(hs, 1.6 * pw, 0.25 * sw)
             conf = float(self.hand_conf[side][i])
-            rf = 0.075 * size + 3.0 + 0.03 * size * (1 - conf)
-            return 'lm', (h, rf, size)
-        return self.hand_shapes_pose(i, side, sw)
+            rf = 0.075 * size + 3.0 + 0.02 * size * (1 - conf)
+            return 'lm', (h, rf, size, float(self.hand_w[side][i]), self.hand_vel[side][i])
+        if self.fb_ok[side][i]:
+            return self.hand_shapes_pose(i, side, sw)
+        return None
 
     def hand_shapes_pose(self, i, side, sw):
         p = self.pose_s[i]
@@ -275,8 +464,7 @@ class Geometry:
         L = np.linalg.norm(d) + 1e-6
         tip = knu + d / L * max(L * 1.3, 0.18 * sw)
         poly = np.array([wr, q[1], q[2], q[3], tip + (q[1] - knu) * 0.8, tip + (q[2] - knu) * 0.8], np.float32)
-        vis = float(np.clip((self.pose[i, idx[0], 3] - 0.25) / 0.3, 0, 1))
-        return ('pose', (poly, 0.10 * sw, vis))
+        return ('pose', (poly, 0.08 * sw, 1.0))
 
 def _clip_halfplane(poly, p0, n):
     """Keep the part of a convex polygon where (x - p0) . n >= 0 (Sutherland-Hodgman)."""

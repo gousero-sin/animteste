@@ -193,6 +193,35 @@ def disk_texture(seed=7, w=2048, h=512):
     return tex
 
 
+def hit_lods(hits, ss, tex_w=2048, tex_h=512, r_span=13.9):
+    """Per super-sample texture LOD for the disk lookups: screen-space footprint of one OUTPUT
+    pixel in disk-texture texels (from finite differences of r and phi between neighbouring
+    samples of the same image order). Returns (h, w, 3) float32, -1 where no hit."""
+    h, w = hits.shape[:2]
+    out = np.full((h, w, hits.shape[2]), -1.0, np.float32)
+    for k in range(hits.shape[2]):
+        r = hits[:, :, k, 0].astype(np.float32)
+        ph = hits[:, :, k, 1].astype(np.float32)
+        v = r > 0
+        fr = np.zeros((h, w), np.float32)
+        fp = np.zeros((h, w), np.float32)
+        for ax in (0, 1):
+            for sh in (1, -1):
+                r2 = np.roll(r, sh, ax)
+                p2 = np.roll(ph, sh, ax)
+                v2 = np.roll(v, sh, ax) & v
+                dr = np.abs(r2 - r)
+                dp = np.abs(np.angle(np.exp(1j * (p2 - ph)))).astype(np.float32)
+                cont = v2 & (dr < 1.5) & (dp < 0.6)
+                fr = np.maximum(fr, np.where(cont, dr, 0))
+                fp = np.maximum(fp, np.where(cont, dp, 0))
+        fr_t = fr * ss * tex_h / r_span
+        fp_t = fp * ss * tex_w / (2 * np.pi)
+        lod = np.log2(np.maximum(np.maximum(fr_t, fp_t * 0.5), 1.0))
+        out[:, :, k] = np.where(v, lod, -1.0)
+    return out
+
+
 class BHData:
     """Loads (or builds and caches) everything the black-hole shader needs."""
 
@@ -240,6 +269,12 @@ class BHData:
                      disk=self.disk.astype(np.float16), bbT=self.bbT, bb=self.bb)
             if log:
                 log(f'[space] BH precompute total {time.time() - t0:.1f}s -> {path}')
+        lp = path.replace('.npz', '_lod.npy')
+        if os.path.exists(lp):
+            self.lods = np.load(lp)
+        else:
+            self.lods = hit_lods(self.hits, ss)
+            np.save(lp, self.lods)
         self._prep_lut()
 
     def _prep_lut(self):

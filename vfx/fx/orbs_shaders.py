@@ -30,42 +30,58 @@ uniform float uCore;    // white-hot core strength
 uniform float uPlume;   // height of the flame plume (local units, ~2.4)
 uniform float uSmoke;   // smoke amount
 
+// Density / temperature of the flame at local point p (units of the orb radius, y up).
+//  * a churning ball (domain-warped fbm) that is sharp-edged (thin smoothstep on the field)
+//  * a plume of ridged "sheet" tongues: two ridged layers scrolling up at different speeds and a
+//    slow cutting noise, so tongues stretch, detach from the ball and flicker out
+//  * temperature: hot pockets inside the ball, cooling quickly with height (tips go deep red)
 float fireField(vec3 p, out float temp, out float smoke){
     float h = max(p.y, 0.0);
     // lean the plume (velocity drag + a slow sway)
     p.xz -= (uLean + vec2(0.20 * sin(uT * 1.7 + uSeed), 0.0)) * h * h * 0.22;
-    // rising, vertically stretched noise coordinates
-    vec3 q = p * vec3(1.55, 0.95, 1.55);
-    q.y -= uT * 2.5;
-    q += vec3(uSeed, uSeed * 0.37, 0.0);
-    vec2 w = vec2(snoise(q * 0.6 + vec3(0.0, 0.0, uT * 0.7)),
-                  snoise(q * 0.6 + vec3(5.2, 1.3, uT * 0.7)));
-    q.xz += w * (0.45 + 0.35 * h);
-    float n = fbm3(q * 1.35, 4);                // ~[-0.8, 0.8]
-    // ball + upward stretched plume
-    vec3 s = vec3(p.x * (1.0 + 0.12 * h), p.y > 0.0 ? p.y / uPlume * 1.25 : p.y * 1.02, p.z * (1.0 + 0.12 * h));
+    vec3 q = p * vec3(1.5, 1.0, 1.5) + vec3(uSeed, uSeed * 0.37, 0.0);
+    vec3 qb = q; qb.y -= uT * 1.7;
+    vec2 w = vec2(snoise(qb * 0.6 + vec3(0.0, 0.0, uT * 0.7)),
+                  snoise(qb * 0.6 + vec3(5.2, 1.3, uT * 0.7)));
+    qb.xz += w * (0.40 + 0.30 * h);
+    float n = fbm3(qb * 1.4, 4);                       // ~[-0.8, 0.8] churning cells
+    float hp = smoothstep(0.15, 1.5, h);               // plume weight
+    // flame tongues (only evaluated where they can matter)
+    float tng = 0.0, cut = 0.0;
+    if (hp > 0.01){
+        vec3 qt = vec3(p.x * 2.4 + w.x * 0.55, p.y * 0.80 - uT * 3.6, p.z * 2.4 + w.y * 0.55) + uSeed;
+        float r1 = 1.0 - abs(snoise(qt));
+        float r2 = 1.0 - abs(snoise(qt * vec3(1.7, 1.45, 1.7) + vec3(3.1, -uT * 1.9, 7.7)));
+        tng = r1 * r1 * 0.85 + r2 * r2 * r2 * r2 * 0.28;               // [0, 1.15]
+        cut = snoise(vec3(p.x * 1.3, p.y * 1.1 - uT * 2.6, p.z * 1.3 + 9.0));
+    }
+    // ball + upward stretched plume envelope
+    vec3 s = vec3(p.x * (1.0 + 0.10 * h), p.y > 0.0 ? p.y / uPlume * 1.25 : p.y * 1.06, p.z * (1.0 + 0.10 * h));
     float d = length(s) - 1.0;
-    float amp = 0.32 + 0.95 * smoothstep(0.0, 1.6, h);
-    float f = -d + n * amp;
-    float dens = smoothstep(0.0, 0.22, f);
-    // temperature: deeper = hotter, turbulent cells, cooling with height
-    temp = 0.12 + 0.72 * clamp(f * 1.4, 0.0, 1.0) + 0.55 * n - 0.24 * h;
+    float f = -d + n * (0.30 + 0.35 * hp) + hp * ((tng - 0.50) * 0.95 + cut * 0.30);
+    float dens = smoothstep(0.03, 0.11, f) * (1.0 - 0.35 * hp);
+    // temperature: hot inside, turbulent cells, rapid cooling with height
+    temp = 0.06 + 0.68 * clamp(f * 1.3, 0.0, 1.0) + 0.40 * n - 0.29 * h + 0.14 * tng * hp;
     // smoke above the flame tips
-    float fs = -d + n * (amp + 0.4) + 0.30;
-    smoke = smoothstep(0.0, 0.5, fs) * smoothstep(0.9, 2.8, h) * (1.0 - dens);
+    float fs = -d + n * 0.8 + 0.30 + hp * 0.25 * cut;
+    smoke = smoothstep(0.0, 0.5, fs) * smoothstep(1.0, 2.8, h) * (1.0 - dens);
     return dens;
 }
+
+uniform float uOcc;      // palm occlusion strength
+uniform sampler2D uHand; // hand coverage (crop of this render target)
 
 void main(){
     vec2 P = fpx() - uC;
     vec2 xy = vec2(P.x, -P.y) / max(uR, 1.0);     // y up
     float gscale = max(uGrow, 0.02);
     xy /= gscale;
-    float zext = 1.45;
-    float bx = abs(xy.x) - (1.6 + 0.35 * max(xy.y, 0.0));
-    if (bx > 0.0 || xy.y < -1.6 || xy.y > uPlume * 1.35 + 0.9) { fragColor = vec4(0.0); return; }
-    const int N = 24;
+    float zext = 1.25;
+    float bx = abs(xy.x) - (1.55 + 0.30 * max(xy.y, 0.0));
+    if (bx > 0.0 || xy.y < -1.45 || xy.y > uPlume * 1.35 + 0.9) { fragColor = vec4(0.0); return; }
+    const int N = 30;
     float dz = 2.0 * zext / float(N);
+    // static interleaved-gradient jitter (no temporal crawl)
     float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * dz;
     vec3 col = vec3(0.0);
     float Tr = 1.0;
@@ -73,19 +89,24 @@ void main(){
     for (int k = 0; k < N; k++){
         float z = zext - dz * float(k) - jitter;
         vec3 p = vec3(xy, z);
+        if (dot(p.xz, p.xz) > 2.6) continue;
         float temp, smoke;
         float dens = fireField(p, temp, smoke);
-        // white-hot churning core, seen through gaps in the outer flame
-        float r2 = dot(p, p);
-        float core = uCore * exp(-r2 * 3.2);
-        temp += core * (0.85 + 0.45 * snoise(p * 3.3 + vec3(0.0, -uT * 1.8, uT * 0.9)));
+        // hot churning core, seen through gaps in the outer flame
+        float r2 = dot(p * vec3(1.0, 0.85, 1.0), p * vec3(1.0, 0.85, 1.0));
+        float core = uCore * exp(-r2 * 5.5);
+        temp += core * (0.50 + 0.50 * snoise(p * 3.3 + vec3(0.0, -uT * 1.8, uT * 0.9)));
         vec3 em = bbody(temp) * dens;
         col += Tr * em * dz;
         smk += Tr * smoke * dz;
-        Tr *= exp(-dens * dz * 2.3);
+        Tr *= exp(-dens * dz * 1.35);
         if (Tr < 0.02) break;
     }
     col *= uAmp;
+    // seat the ball in the palm: fingers curled around the lower hemisphere hide part of it
+    float hc = texture(uHand, vUV).r;
+    float low = smoothstep(0.15, -0.55, xy.y);
+    col *= 1.0 - uOcc * hc * low;
     float a = clamp(smk * 0.6 * uSmoke, 0.0, 0.85);
     fragColor = vec4(col, a);
 }
@@ -291,8 +312,8 @@ void main(){
     env *= smoothstep(-2.2, -0.4, P.y);
     vec2 q = P * 1.3 + vec2(0.0, -uT * 0.55);
     vec2 w = vec2(fbm2(q * 1.1 + vec2(0.0, uT * 0.2), 3), fbm2(q * 1.1 + vec2(4.3, -uT * 0.25), 3));
-    float n = fbm2(q * 1.6 + w * 1.4 + vec2(uT * 0.1, 0.0), 5);
-    float d = pow(smoothstep(0.30, 0.95, n), 1.6) * env * uAmt * 0.8;
+    float n = fbm2(vec2(q.x * 2.2, q.y * 1.1) + w * 1.6 + vec2(uT * 0.1, 0.0), 5);
+    float d = pow(smoothstep(0.40, 0.95, n), 2.2) * env * uAmt * 0.75;
     // keep the very centre clear (the orb is there)
     d *= smoothstep(0.6, 1.25, length(P));
     fragColor = vec4(uCol * d, d * 0.35);
@@ -300,85 +321,103 @@ void main(){
 '''
 
 # ------------------------------------------------------------------ plasma charge orb (fire + ice swirl)
-PLASMA = r'''
+PLASMA = r"""
 uniform vec2 uC; uniform float uR; uniform float uT; uniform float uAmp; uniform float uCharge; uniform float uCorona;
 vec3 rotY(vec3 p, float a){ float c = cos(a), s = sin(a); return vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z); }
+vec3 rotX(vec3 p, float a){ float c = cos(a), s = sin(a); return vec3(p.x, c * p.y - s * p.z, s * p.y + c * p.z); }
 void main(){
     vec2 P = (fpx() - uC) / uR; P.y = -P.y;
     float r = length(P);
-    vec3 vio = vec3(1.25, 0.75, 2.4);
-    vec3 col = vec3(0.0);
-    // corona: flame-like rays streaming outward (seam-free polar noise)
-    float ca = P.x / max(r, 1e-4), sa = P.y / max(r, 1e-4);
-    float cn = fbm3(vec3(ca * 2.2, sa * 2.2, r * 2.4 - uT * 3.5), 4);
-    float cn2 = snoise(vec3(ca * 5.0, sa * 5.0, r * 4.0 - uT * 6.0));
+    vec3 vio = vec3(1.15, 0.70, 2.4);
     float out_r = max(r - 1.0, 0.0);
-    float corona = exp(-out_r * (3.2 - 1.6 * cn)) * smoothstep(0.85, 1.02, r) * (0.55 + 0.9 * max(cn, 0.0) + 0.25 * cn2);
-    float halo = 0.30 / (1.0 + out_r * out_r * 9.0) * step(1.0, r);
-    col += (mix(vio, vec3(2.4, 2.2, 2.6), 0.35) * corona * 1.2 + vio * halo) * uCorona;
+    float ca = P.x / max(r, 1e-4), sa = P.y / max(r, 1e-4);
+    float rays = pow(0.5 + 0.5 * snoise(vec3(ca * 3.0, sa * 3.0, uT * 1.7)), 3.0);
+    float rays2 = pow(0.5 + 0.5 * snoise(vec3(ca * 7.0, sa * 7.0, uT * 3.1 + 5.0)), 4.0);
+    float halo = exp(-out_r * 2.6) * 0.30 + exp(-out_r * 8.0) * 0.95;
+    vec3 col = vio * halo * (0.55 + 0.9 * rays + 0.6 * rays2 * exp(-out_r * 3.0)) * uCorona;
     if (r < 1.0){
         float z = sqrt(1.0 - r * r);
-        vec3 n = vec3(P, z);
-        vec3 q = rotY(n, uT * 1.6);
-        vec3 w = vec3(snoise(q * 1.4 + vec3(0.0, uT * 0.5, 0.0)), snoise(q * 1.4 + vec3(7.1, -uT * 0.4, 1.0)), snoise(q * 1.4 + vec3(3.3, 2.0, uT * 0.3)));
-        float band = snoise(q * 1.25 + w * 0.9 + vec3(0.0, uT * 0.7, 0.0));
-        float det = fbm3(q * 4.2 + w * 1.2 + vec3(0.0, 0.0, uT * 1.3), 3);
-        vec3 fireC = vec3(2.3, 0.75, 0.16), iceC = vec3(0.35, 0.95, 2.4);
-        vec3 base = mix(fireC, iceC, smoothstep(-0.22, 0.22, band));
-        float seam = exp(-abs(band) * 10.0);
-        vec3 surf = base * (0.55 + 0.6 * det) + vio * seam * 2.2;
-        surf = surf * (0.45 + 0.9 * z * z) + vec3(2.6, 2.5, 3.0) * pow(z, 5.0) * (0.8 + 1.6 * uCharge);
-        surf += vio * pow(1.0 - z, 2.5) * 1.6;
-        float arc = 1.0 - abs(snoise(q * 3.2 + vec3(0.0, 0.0, floor(uT * 15.0) * 0.37)));
-        surf += vec3(2.0, 1.8, 3.0) * smoothstep(0.955, 0.995, arc) * (0.8 + uCharge);
-        float aa = smoothstep(1.0, 0.97, r);
-        col = mix(col, surf, aa);
+        vec3 acc = vec3(2.4, 2.2, 2.9) * pow(z, 14.0) * (0.35 + 0.9 * uCharge);
+        acc += vio * (0.10 + 0.18 * z);
+        for (int k = 0; k < 3; k++){
+            float rad = 1.0 - 0.17 * float(k);
+            if (r >= rad) continue;
+            float zz = sqrt(rad * rad - r * r);
+            vec3 cc = k == 0 ? vec3(2.5, 0.85, 0.22) : (k == 1 ? vec3(0.35, 1.1, 2.7) : vec3(1.7, 1.1, 2.9));
+            float dir = k == 1 ? -1.0 : 1.0;
+            for (int sd = 0; sd < 2; sd++){
+                vec3 n = vec3(P, sd == 0 ? zz : -zz) / rad;
+                vec3 q = rotY(rotX(n, 0.7 * float(k) + 0.3 * uT), dir * uT * (1.3 + 0.6 * float(k)));
+                float f = 1.0 - abs(snoise(q * (2.0 + 0.7 * float(k)) + vec3(0.0, 0.0, uT * 0.9 + float(k) * 3.1)));
+                f = pow(f, 7.0);
+                acc += cc * f * (sd == 0 ? 1.0 : 0.35) * (1.0 + 0.15 * uCharge);
+            }
+        }
+        acc += vio * pow(1.0 - z, 3.0) * 1.5;
+        col = mix(col, acc + vio * 0.85 * uCorona * 0.4, smoothstep(1.0, 0.975, r));
     }
     fragColor = vec4(col * uAmp, 0.0);
 }
-'''
+"""
 
 # ------------------------------------------------------------------ detonation cloud (fire + ice + smoke)
 BOOM = COMMON + r'''
-uniform vec2 uC; uniform float uR; uniform float uT; uniform float uAge; uniform float uHeat; uniform float uSmoke; uniform float uAmp;
+uniform vec2 uC; uniform float uR; uniform float uT; uniform float uAge; uniform float uHeat; uniform float uSmoke;
+uniform float uFade; uniform int uN;
 vec3 iceRamp(float x){ x = max(x, 0.0);
     return vec3(0.10, 0.35, 0.9) * smoothstep(0.05, 0.4, x) + vec3(0.5, 0.8, 1.2) * smoothstep(0.35, 0.9, x) + vec3(1.4, 1.5, 1.7) * smoothstep(0.85, 1.4, x); }
-float field(vec3 p, out float temp, out float iceF, out float smoke){
+float gN, gLobe;
+// density of the cloud at p (units of the blast radius, y up) and its gas temperature
+float field(vec3 p, out float temp){
+    p.y -= 0.25 * uAge;                                   // buoyant rise
     float r = length(p);
-    vec3 q = p * 1.7 + vec3(0.0, -uAge * 0.9, uAge * 0.7);
-    vec2 w = vec2(snoise(q * 0.7), snoise(q * 0.7 + vec3(4.1, 2.2, 0.0)));
-    q.xy += w * 0.5;
-    float n = fbm3(q, 5);
-    float d = r - 1.0 - n * 0.42;
-    float body = smoothstep(0.0, 0.22, -d);
-    float hollow = 0.30 + 0.70 * smoothstep(0.15, 0.80, r + n * 0.25);
-    float dens = body * hollow;
-    temp = uHeat * (0.55 + 0.75 * n + 0.45 * (1.0 - r));
-    iceF = smoothstep(0.05, 0.45, snoise(p * 1.15 + vec3(9.0, 1.0, uAge * 0.3)));
-    smoke = body * smoothstep(0.75, 0.25, temp);
+    if (r > 1.62){ temp = 0.0; gN = 0.0; gLobe = 0.0; return 0.0; }
+    vec3 dir = p / max(r, 1e-3);
+    // material coordinates: features grow with the cloud and roll from the surface inward
+    vec3 q = p * 1.45 - dir * (uAge * 0.85) * (0.35 + 0.65 * r) + vec3(3.1, 7.3, 1.7);
+    vec2 w = vec2(snoise(q * 0.65), snoise(q * 0.65 + vec3(4.1, 2.2, 0.0)));
+    q.xy += w * 0.32;
+    float lobes = snoise(p * 1.15 + vec3(2.0, 5.0, 1.0));  // big lobes, fixed for this blast
+    // billowy (cauliflower) noise
+    float n = 0.0, ab = 0.5; vec3 qq = q * 1.25;
+    for (int o = 0; o < 3; o++){ n += ab * (abs(snoise(qq)) * 2.0 - 0.6); qq = qq * 2.07 + vec3(1.7, 9.2, 3.1); ab *= 0.5; }
+    gN = n; gLobe = lobes;
+    float d = r - 1.0 - lobes * 0.27 - n * 0.36;
+    float dens = smoothstep(0.0, 0.13, -d) * uFade;
+    // hot pockets deep inside; the outer shell is cooler and turns to smoke first
+    float inner = smoothstep(1.28, 0.25, r + n * 0.35 - lobes * 0.12);
+    float pk = smoothstep(-0.25, 0.55, n * 1.5 + lobes * 0.45);
+    temp = uHeat * inner * (0.38 + 0.95 * pk);
     return dens;
 }
 void main(){
     vec2 P = fpx() - uC;
     vec2 xy = vec2(P.x, -P.y) / max(uR, 1.0);
-    if (dot(xy, xy) > 2.6){ fragColor = vec4(0.0); return; }
-    const int N = 16;
-    float zext = 1.35;
-    float dz = 2.0 * zext / float(N);
+    float rr = dot(xy, xy);
+    if (rr > 2.62){ fragColor = vec4(0.0); return; }
+    float zext = sqrt(max(2.62 - rr, 0.01));
+    float dz = 2.0 * zext / float(uN);
+    // static interleaved-gradient dither (no per-frame crawl)
     float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * dz;
-    vec3 col = vec3(0.0); float Tr = 1.0; float sm = 0.0;
-    for (int k = 0; k < N; k++){
+    vec3 col = vec3(0.0); float Tr = 1.0;
+    for (int k = 0; k < 32; k++){
+        if (k >= uN) break;
         vec3 p = vec3(xy, zext - dz * float(k) - jitter);
-        float temp, iceF, smoke;
-        float dens = field(p, temp, iceF, smoke);
-        if (dens < 1e-3 && smoke < 1e-3) continue;
-        vec3 em = mix(bbody(temp), iceRamp(temp) * 1.2, iceF * 0.55) * dens;
-        col += Tr * em * dz;
-        sm += Tr * smoke * dens * dz;
-        Tr *= exp(-dens * dz * (1.6 + 2.0 * uSmoke));
-        if (Tr < 0.02) break;
+        float temp;
+        float dens = field(p, temp);
+        if (dens < 1e-3) continue;
+        // only hot gas glows (steep gate); white only in the small hottest cores
+        float glowk = smoothstep(0.26, 0.62, temp);
+        float tc = min(temp, 1.02 + 0.22 * smoothstep(1.25, 1.7, temp));
+        vec3 em = mix(bbody(tc), iceRamp(tc) * 1.1, 0.30 * smoothstep(0.1, 0.6, gLobe) * smoothstep(0.8, 1.3, temp));
+        em *= glowk;
+        // smoke: very low albedo, lit faintly from the hot interior
+        float sm = 1.0 - glowk;
+        vec3 smk = vec3(0.024, 0.021, 0.020) * (0.5 + 0.9 * smoothstep(-0.3, 0.6, gN)) + bbody(temp) * 0.07;
+        col += Tr * (em * 1.25 + smk) * dens * dz * 2.0;
+        Tr *= exp(-dens * dz * (0.9 + 2.6 * sm * uSmoke));
+        if (Tr < 0.01) break;
     }
-    float a = clamp(sm * 1.4 * uSmoke, 0.0, 0.92);
-    fragColor = vec4(col * uAmp, a);
+    fragColor = vec4(col, 1.0 - Tr);
 }
 '''

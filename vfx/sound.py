@@ -384,7 +384,8 @@ def sub_drop(dur, f0, f1, tau_f, tau_a, drive=2.5, attack=0.004, h2=0.25):
     y = np.sin(TAU * ph) + h2 * np.sin(2 * TAU * ph)
     y = sat(y * 0.9, drive)                   # harmonics so phones "hear" the sub
     y = butter(y, 'low', 900, 2)
-    return y * (1 - np.exp(-t / attack)) * np.exp(-t / tau_a)
+    tail = smooth01((n - np.arange(n)) / max(1.0, 0.25 * n))
+    return y * (1 - np.exp(-t / attack)) * np.exp(-t / tau_a) * tail
 
 
 def zap(r, dur=0.12, bright=1.0):
@@ -503,9 +504,28 @@ def integrated(x):
     return -0.691 + 10 * np.log10(p[g2].mean())
 
 
+def max_momentary(x):
+    x = x if x.ndim == 2 else x[:, None]
+    if len(x) < ns(0.45):
+        x = np.pad(x, ((0, ns(0.45) - len(x)), (0, 0)))
+    return float(loud_curve(x, 0.4, 0.02)[1].max())
+
+
+def os_peak(x):
+    """Per-sample 4x-oversampled absolute peak (max over channels), computed channel by channel."""
+    x = x if x.ndim == 2 else x[:, None]
+    n = len(x)
+    pk = np.abs(x).max(1).astype(np.float32)
+    for c in range(x.shape[1]):
+        up = np.abs(ss.resample_poly(x[:, c].astype(np.float32), 4, 1))
+        m = up[:n * 4].reshape(-1, 4).max(1)
+        pk[:len(m)] = np.maximum(pk[:len(m)], m)
+        del up
+    return pk
+
+
 def true_peak(x):
-    up = ss.resample_poly(x, 4, 1, axis=0)
-    return db(np.abs(up).max())
+    return db(float(os_peak(x).max()))
 
 
 # =============================================================================================
@@ -556,7 +576,7 @@ def voice_vad(m):
     """10 ms frames voice-activity (bool) + raw level (dB) for the mono voice m."""
     lv = frame_db(butter(m, 'band', [150, 4000], 2), 480, 960)
     floor = np.percentile(lv, 10)
-    thr = floor + 13.0
+    thr = max(floor + 20.0, np.percentile(lv, 95) - 20.0)
     act = lv > thr
     # hangover 220 ms, pre-roll 60 ms, drop blips < 50 ms
     act = maximum_filter1d(act.astype(np.uint8), 5).astype(bool)
@@ -663,14 +683,18 @@ def space_at(t):
 
 class Bus:
     def __init__(self, sends):
-        self.dry = np.zeros((N, 2), np.float64)
-        self.send = {k: np.zeros((N, 2), np.float64) for k in sends}
+        self.dry = np.zeros((N, 2), np.float32)
+        self.send = {k: np.zeros((N, 2), np.float32) for k in sends}
         self.log = []
 
-    def add(self, x, t0, gain_db=0.0, pan=0.0, rev=0.0, space=None, name='', dry=1.0):
+    def add(self, x, t0, gain_db=0.0, pan=0.0, rev=0.0, space=None, name='', dry=1.0, lufs=None):
+        """lufs: normalise the sound's max momentary loudness to this (internal scale, voice = -20
+        LUFS integrated) before applying gain_db."""
         x = np.asarray(x, np.float64)
         if x.ndim == 1 or np.ndim(pan) > 0 or pan != 0.0:
             x = pan2(x, pan)
+        if lufs is not None:
+            gain_db = gain_db + lufs - max_momentary(x)
         x = fade(x, 0.002, 0.004) * undb(gain_db)
         i0 = int(round(t0 * SR))
         a0 = max(0, -i0)
@@ -711,8 +735,8 @@ def sfx_eraser(d, base, size, seed):
     for k, mult in enumerate([1, 1.5, 2, 3, 4, 6]):
         on = r.uniform(0.0, ts)
         g = np.clip(t - on, 0, None)
-        p = sine(base * mult * (1 + r.uniform(-0.002, 0.002)), n) * (g > 0)
-        p *= (1 - np.exp(-g / 0.03)) * np.exp(-g / (0.5 + 0.25 * size)) / (1 + 0.5 * k)
+        p = sine(base * mult * (1 + r.uniform(-0.002, 0.002) + 0.0015 * np.sin(TAU * r.uniform(3, 6) * t)), n) * (g > 0)
+        p *= (1 - np.exp(-g / 0.03)) * np.exp(-g / (0.3 + 0.2 * size)) / (1 + 0.5 * k)
         out += pan2(p * 0.22, r.uniform(-0.4, 0.4))
     # 3. burn crackle (dissolve front)
     t0b = 0.25 * d
@@ -727,15 +751,17 @@ def sfx_eraser(d, base, size, seed):
     air = whoosh(T, [(0, 700), (t0b, 900), (d, 3500), (T, 7000)],
                  [(0, 0), (t0b, 0.05), (0.7 * d, 0.55), (d + 0.6, 0.25), (T, 0)], bw=0.6, seed=seed + 31)
     out += air * 0.55
-    # 6. soft warm bloom on reveal
-    bl = sine(base / 8, n) * env_pts(t, [(0, 0), (0.55 * d, 0), (0.8 * d, 1), (T, 0)]) ** 2
-    out += pan2(bl * 0.25, 0)
+    # 6. soft warm bloom on reveal (short, airy low-mid swell)
+    bl = spec(colored(n, seed + 41, -1.0), lambda f, tt: g_bp(f, base / 4, 0.5))
+    bl *= env_pts(t, [(0, 0), (0.6 * d, 0), (0.85 * d, 1), (d + 0.5, 0)]) ** 2
+    out += pan2(bl * 0.12, 0)
     return out
 
 
 def sfx_studio():
-    """Blackout: power-off clunk + dying hum, ink wave whoosh, tile disintegration, sub drop."""
-    T = 4.2
+    """Blackout: power-off clunk + dying hum at 0, darkness wave building to a peak at ~0.9 s
+    (tiles disintegrating, sucked away), sub drop through the gap, deep settle at 1.75 s."""
+    T = 4.6
     n = ns(T)
     t = tvec(n)
     out = np.zeros((n, 2))
@@ -744,7 +770,7 @@ def sfx_studio():
     cl = np.zeros(n)
     k = click(r, 1800, 0.006, 3) * 0.6
     cl[:len(k)] += k
-    th = sub_drop(0.4, 140, 70, 0.05, 0.08, 1.5)
+    th = sub_drop(0.5, 140, 70, 0.05, 0.08, 1.5)
     cl[:len(th)] += th * 0.9
     out += pan2(cl, 0)
     # mains hum dying with pitch dive
@@ -752,32 +778,33 @@ def sfx_studio():
     hum = sum(sine(fh * h, n) / h ** 1.2 for h in (1, 2, 3, 5, 7))
     hum = sat(hum * 1.2, 2.0) * env_pts(t, [(0, 0), (0.01, 0.6), (0.15, 0.5), (0.75, 0)])
     out += pan2(hum * 0.35, 0)
-    # ink wave whoosh radiating outward (stereo widening), 0.05 .. 1.5
-    w = whoosh(T, [(0, 120), (0.55, 700), (1.3, 260), (T, 120)],
-               [(0, 0), (0.08, 0.35), (0.55, 1.0), (1.4, 0.3), (2.2, 0)], bw=0.7, seed=401, corr=0.2,
-               tone=([(0, 110), (1.5, 45)], 0.25))
-    w = widen(w, np.interp(t, [0, 0.6, 1.5], [0.2, 1.4, 1.8]))
+    # ink wave radiating outward (stereo widening), builds 0.15 -> peak 0.9 -> 2.3
+    pk = 0.9
+    w = whoosh(T, [(0, 120), (0.3, 160), (pk, 750), (pk + 0.7, 260), (T, 120)],
+               [(0, 0), (0.15, 0.08), (pk - 0.3, 0.45), (pk, 1.0), (pk + 0.8, 0.3), (pk + 1.6, 0)], bw=0.7, seed=401,
+               corr=0.2, tone=([(0, 90), (pk, 110), (pk + 1.0, 45)], 0.25))
+    w = widen(w, np.interp(t, [0, pk, pk + 0.9], [0.2, 1.4, 1.8]))
     out += w * 0.9
-    # disintegration: ceramic crumble grains, peak ~0.75 s, widening
-    rate = lambda tt: 380 * np.exp(-0.5 * ((tt - 0.8) / 0.35) ** 2) + 20 * np.exp(-tt / 2)
+    # disintegration: ceramic crumble grains, peak at the wave front, widening
+    rate = lambda tt: 380 * np.exp(-0.5 * ((tt - (pk + 0.05)) / 0.3) ** 2) + 25 * smooth01(tt / 0.6) * np.exp(-np.maximum(tt - pk, 0) / 1.5)
     times = poisson_times(T, rate, 402)
     rr = rng(403)
-    pans = np.clip(rr.normal(0, 1, len(times)) * np.interp(times, [0, 1.2], [0.2, 0.9]), -1, 1)
+    pans = np.clip(rr.normal(0, 1, len(times)) * np.interp(times, [0, pk + 0.4], [0.2, 0.9]), -1, 1)
     fcs = np.exp(rr.uniform(np.log(1500), np.log(6500), len(times)))
     amps = rr.uniform(0.2, 1.0, len(times))
     deb = grains(T, times, lambda k, q: click(q, fcs[k], q.uniform(0.0015, 0.007), 3) * amps[k], pans, 404)
     out += deb * 0.5
-    # "sucked away": reverse whoosh 1.15 -> 1.7 then cut
-    sw = whoosh(0.6, [(0, 400), (0.6, 4000)], [(0, 0), (0.5, 0.8), (0.6, 0)], bw=0.5, seed=405)
-    i0 = ns(1.15)
+    # "sucked away": reverse whoosh into the settle, then cut
+    sw = whoosh(0.55, [(0, 400), (0.55, 4000)], [(0, 0), (0.48, 0.8), (0.55, 0)], bw=0.5, seed=405)
+    i0 = ns(1.2)
     out[i0:i0 + len(sw)] += sw * 0.55
-    # sub drop
-    sd = sub_drop(3.0, 85, 27, 0.6, 1.1, 2.6)
-    i0 = ns(0.15)
+    # sub drop through the gap
+    sd = sub_drop(3.2, 85, 27, 0.6, 1.1, 2.6)
+    i0 = ns(pk - 0.1)
     out[i0:i0 + len(sd)] += pan2(sd, 0) * 0.95
     # darkness settles: deep soft hit at 1.75
-    hit = sub_drop(2.0, 70, 38, 0.15, 0.6, 2.0) * 0.8
-    body = butter(colored(ns(2.0), 406, -2), 'low', 260, 2) * env_ar(tvec(ns(2.0)), 0.01, 0.35) * 0.35
+    hit = sub_drop(2.4, 70, 38, 0.15, 0.6, 2.0) * 0.8
+    body = butter(colored(ns(2.4), 406, -2), 'low', 260, 2) * env_ar(tvec(ns(2.4)), 0.01, 0.35) * 0.35
     i0 = ns(1.75)
     out[i0:i0 + len(hit)] += pan2(hit + body, 0)
     return out
@@ -972,16 +999,16 @@ def sfx_fusion(d, t_abs0, panR, panL):
     p_ice = cL * rad * 0.8 * (1 - u) - 0.45 * rad * np.sin(ph)
     depth = 1 + 0.35 * np.cos(ph)
     fb = fire_bed(T, lambda tt: 0 * tt, 0, 900)[:, 0]
-    out += pan2(fb * depth * 0.9, p_fire)
+    out += pan2(fb * depth * 0.45, p_fire)
     ib = ice_bed(T, lambda tt: 0 * tt, 0, 910)[:, 0]
-    out += pan2(ib * (2 - depth) * 1.2, p_ice)
+    out += pan2(ib * (2 - depth) * 0.9, p_ice)
     # electric hum rising
     f0 = hz('D2') * 2 ** (3 / 12 * u ** 2)
     trem = 0.65 + 0.35 * np.sin(TAU * np.cumsum(6 + 12 * u) / SR)
     hm = saw(f0, n) + 0.7 * saw(f0 * 1.5 * 1.003, n) + 0.5 * saw(f0 * 2 * 0.997, n)
     hm = spec(hm, lambda f, tt: g_bp(f, np.interp(tt, [0, d], [500, 1800]), 1.0))
-    hm *= trem * smooth01(u * 1.6) * (0.5 + 0.5 * u)
-    out += pan2(hm * 0.35, 0) + widen(pan2(hm * 0.12, 0), 0)
+    hm *= trem * smooth01(u * 1.6) * (0.3 + 0.7 * u)
+    out += pan2(hm * 0.6, 0)
     # arcs between the hands
     times = poisson_times(T, lambda tt: 3 + 11 * (tt / d) ** 1.3, 920)
     r = rng(921)
@@ -996,7 +1023,7 @@ def sfx_fusion(d, t_abs0, panR, panL):
     # violet riser in the last 60 %
     ri = whoosh(T, [(0, 600), (d * 0.4, 600), (d, 4000)], [(0, 0), (d * 0.4, 0), (d, 0.55)], bw=0.6, seed=925)
     out += ri
-    return out
+    return out * (0.55 + 0.45 * smooth01(u))[:, None]
 
 
 def sfx_release_charge(t_rel, t_boom):
@@ -1009,24 +1036,27 @@ def sfx_release_charge(t_rel, t_boom):
     # spread whoosh, outward
     w = whoosh(0.7, [(0, 500), (0.25, 1800), (0.7, 700)], [(0, 0), (0.08, 0.8), (0.7, 0)], bw=0.6, seed=950, corr=0.1)
     w = widen(w, np.interp(tvec(len(w)), [0, 0.5], [0.5, 1.8]))
-    out[:len(w)] += w * 0.8
+    out[:len(w)] += w * 0.35
     # condense thrum at 0.25
     i0 = ns(0.22)
     m = ns(0.5)
-    th = sub_drop(0.5, 70, 110, 0.15, 0.25, 2.0) * 0.6
+    th = sub_drop(0.5, 70, 110, 0.15, 0.25, 2.0) * 0.3
     out[i0:i0 + m] += pan2(th, 0)
     # tonal charge riser
     f = hz('D3') * 2 ** (1.0 * smooth01(u) ** 1.3)
     trem = 0.6 + 0.4 * np.sin(TAU * np.cumsum(4 + 26 * u ** 2) / SR)
     tone = saw(f, n) + 0.6 * saw(f * 1.5 * 1.002, n) + 0.4 * saw(f * 2.003, n)
     tone = spec(tone, lambda ff, tt: g_lp(ff, np.interp(tt, [0, d], [700, 5000]), 2))
-    out += pan2(tone * trem * smooth01(u * 3) * (0.25 + 0.75 * u ** 1.5) * 0.30, 0)
-    # noise riser
-    ri = whoosh(d, [(0, 400), (d, 7000)], [(0, 0), (d * 0.98, 0.9), (d, 0)], bw=0.5, seed=951)
-    out += ri * 0.6
+    out += pan2(tone * trem * smooth01(u * 3) * (0.1 + 0.9 * u ** 2) * 0.45, 0)
+    # noise riser (exponential crescendo, energy moving up out of the speech band)
+    ri = whoosh(d, [(0, 500), (d * 0.6, 2500), (d, 8000)], [(0, 0), (d * 0.98, 1.0), (d, 0)], bw=0.5, seed=951)
+    out += ri * (0.15 + 0.85 * u ** 2.2)[:, None] * 1.2
     # shepard up
-    sh = shepard(d, 0.6 + 2.5 * u, 900, 7, True, 952) * smooth01(u * 2) * (0.3 + 0.7 * u)
-    out += pan2(sh * 0.25, 0)
+    sh = shepard(d, 0.6 + 2.5 * u, 1400, 7, True, 952) * smooth01(u * 2) * (0.1 + 0.9 * u ** 2)
+    out += pan2(sh * 0.35, 0)
+    # sub swell under it
+    sw = sat(sine(hz('D1') * 2 ** (u * 0.5), n), 1.5) * u ** 2
+    out += pan2(sw * 0.45, 0)
     # arcs, contracting
     times = poisson_times(d, lambda tt: 5 + 40 * (tt / d) ** 2, 953)
     r = rng(954)
@@ -1078,7 +1108,9 @@ def sfx_boom():
     ru = noise2(n, 1007, -2.0, 0.7)
     ru = butter(ru, 'low', 140, 2) * env_ar(t, 0.05, 1.0)[:, None]
     out += ru * 0.6
-    return out
+    # glue: soft-saturate the whole hit (lower crest, denser, reads louder on phones)
+    out = norm_peak(out)
+    return sat(out, 2.2)
 
 
 def sfx_portal_open(T_sus, seed=1100):
@@ -1373,104 +1405,113 @@ def sfx_claude_accent():
 # =============================================================================================
 # SFX timeline
 # =============================================================================================
+# max momentary loudness targets (internal scale: voice integrated = -20 LUFS, master adds ~+6 dB)
+LV = dict(claude=-40, eraser=-29, studio=-19, studio_tone=-54, suit=-26, antic=-28, fire_ignite=-21,
+          fire_bed=-27, ice_form=-24, ice_bed=-30, fusion=-24, charge=-20, boom=-16, portal=-24, suck=-21,
+          close=-21, tunnel=-22, exit=-20, arrive=-25, space=-36, bh_form=-20, bh_bed=-30, strange=-24,
+          wipe=-21)
+
+
 def build_sfx():
     bus = Bus(['bath', 'studio', 'tunnel', 'space'])
     panR = track_pan('R')
     panL = track_pan('L')
 
     # intro accent on "Claude"
-    bus.add(sfx_claude_accent(), 2.80, -24, 0, 0.3, name='claude_accent')
+    bus.add(sfx_claude_accent(), 2.80, 0, 0, 0.3, name='claude_accent', lufs=LV['claude'])
 
     # removals: magic eraser (scan -> burn -> particles), pitched up a step each time
-    for key, base, pan, size, sd in (('clean_clutter', hz('A5'), 0.5, 1.0, 100),
-                                    ('clean_flush', hz('C#6'), 0.12, 0.55, 120),
-                                    ('clean_shower', hz('E6'), -0.6, 0.9, 140)):
+    for key, base, pan, size, sd, off in (('clean_clutter', hz('A5'), 0.5, 1.0, 100, 0),
+                                         ('clean_flush', hz('C#6'), 0.12, 0.55, 120, -3),
+                                         ('clean_shower', hz('E6'), -0.6, 0.9, 140, 0)):
         a, b = EV[key]
-        bus.add(sfx_eraser(b - a, base, size, sd), a, -9, pan, 0.35, name=key)
+        bus.add(sfx_eraser(b - a, base, size, sd), a, off, pan, 0.35, name=key, lufs=LV['eraser'])
 
     # studio blackout
-    bus.add(sfx_studio(), EV['studio'][0] - 0.05, -2, 0, 0.35, name='studio')
+    bus.add(sfx_studio(), EV['studio'][0] - 0.05, 0, 0, 0.35, name='studio', lufs=LV['studio'])
     # studio room tone (very faint air) through to the tunnel
     t0, t1 = EV['studio'][0] + 1.2, EV['tunnel'][0] + 0.05
     rt = butter(noise2(ns(t1 - t0), 300, -2.0, 0.3), 'band', [40, 600], 2)
     rt *= env_pts(tvec(len(rt)), [(0, 0), (1.5, 1), (t1 - t0 - 0.3, 1), (t1 - t0, 0)])[:, None]
-    bus.add(rt, t0, -46, 0, 0.0, name='studio_tone')
+    bus.add(rt, t0, 0, 0, 0.0, name='studio_tone', lufs=LV['studio_tone'])
 
     # suit
     a, b = EV['suit']
-    bus.add(sfx_suit(b - a), a, -8, 0, 0.3, name='suit')
+    bus.add(sfx_suit(b - a), a, 0, 0, 0.3, name='suit', lufs=LV['suit'])
 
     # anticipation
     a, b = EV['anticipation']
-    bus.add(sfx_anticipation(EV['fire_on'] - a, panR, panL, a), a, -10, 0, 0.25, name='anticipation')
+    bus.add(sfx_anticipation(EV['fire_on'] - a, panR, panL, a), a, 0, 0, 0.25, name='anticipation', lufs=LV['antic'])
 
     # fire ignition + bed (until the fusion)
     tf = EV['fire_on']
-    bus.add(sfx_fire_ignite(), tf - 0.16, -3, panR(tf), 0.3, name='fire_ignite')
+    bus.add(sfx_fire_ignite(), tf - 0.16, 0, panR(tf), 0.3, name='fire_ignite', lufs=LV['fire_ignite'])
     T = EV['fusion'][0] + 0.4 - (tf + 0.1)
     fb = fire_bed(T, panR, tf + 0.1)
     fb *= env_pts(tvec(len(fb)), [(0, 0), (0.25, 1), (T - 0.5, 1), (T, 0)])[:, None]
-    bus.add(fb, tf + 0.1, -13, 0, 0.2, name='fire_bed')
+    bus.add(fb, tf + 0.1, 0, 0, 0.2, name='fire_bed', lufs=LV['fire_bed'])
 
     # ice formation + bed
     ti = EV['ice_on']
-    bus.add(sfx_ice_form(), ti - 0.25, -5, panL(ti), 0.35, name='ice_form')
+    bus.add(sfx_ice_form(), ti - 0.25, 0, panL(ti), 0.35, name='ice_form', lufs=LV['ice_form'])
     T = EV['fusion'][0] + 0.4 - (ti + 0.55)
     ib = ice_bed(T, panL, ti + 0.55)
     ib *= env_pts(tvec(len(ib)), [(0, 0), (0.3, 1), (T - 0.5, 1), (T, 0)])[:, None]
-    bus.add(ib, ti + 0.55, -9, 0, 0.3, name='ice_bed')
+    bus.add(ib, ti + 0.55, 0, 0, 0.3, name='ice_bed', lufs=LV['ice_bed'])
 
     # fusion
     a, b = EV['fusion']
     fu = sfx_fusion(b - a, a, panR, panL)
     fu *= env_pts(tvec(len(fu)), [(0, 0), (0.35, 1), (b - a, 1)])[:, None]
-    bus.add(fu, a, -8, 0, 0.3, name='fusion')
+    bus.add(fu, a, 0, 0, 0.3, name='fusion', lufs=LV['fusion'])
 
     # release + charge (ends 22 ms before the boom)
-    bus.add(sfx_release_charge(EV['release'], EV['finale_boom']), EV['release'], -6, 0, 0.3, name='charge')
+    bus.add(sfx_release_charge(EV['release'], EV['finale_boom']), EV['release'], 0, 0, 0.3, name='charge',
+            lufs=LV['charge'])
     # finale boom + debris tail
-    bus.add(sfx_boom(), EV['finale_boom'], 0, 0, 0.45, name='finale_boom')
+    bus.add(sfx_boom(), EV['finale_boom'], 0, 0, 0.45, name='finale_boom', lufs=LV['boom'])
 
     # ceiling portal: opening swell peaks at ceil_portal start, vortex sustains until the suck
     a, b = EV['ceil_portal']
     T_sus = EV['suck'][1] - a
     po = sfx_portal_open(T_sus)
     po *= env_pts(tvec(len(po)), [(0, 1), (0.4 + T_sus - 0.25, 1), (0.4 + T_sus, 0)])[:, None]
-    bus.add(po, a - 0.4, -8, 0, 0.35, name='ceil_portal')
+    bus.add(po, a - 0.4, 0, 0, 0.35, name='ceil_portal', lufs=LV['portal'])
     # suction
     a, b = EV['suck']
-    bus.add(sfx_suck(b - a), a, -5, 0, 0.3, name='suck')
+    bus.add(sfx_suck(b - a), a, 0, 0, 0.3, name='suck', lufs=LV['suck'])
     # collapse + flash (flash lands at close + 0.45)
     a, b = EV['ceil_portal_close']
-    bus.add(sfx_portal_close(), a, -4, 0, 0.35, space='studio', name='portal_close')
+    bus.add(sfx_portal_close(), a, 0, 0, 0.35, space='studio', name='portal_close', lufs=LV['close'])
     # tunnel
     a, b = EV['tunnel']
     tu = sfx_tunnel(b - a)
     tu *= env_pts(tvec(len(tu)), [(0, 0), (0.3, 1), (b - a, 1)])[:, None]
-    bus.add(tu, a, -6, 0, 0.3, space='tunnel', name='tunnel')
-    bus.add(sfx_exit_flash(), b, -4, 0, 0.5, space='space', name='exit_flash')
+    bus.add(tu, a, 0, 0, 0.3, space='tunnel', name='tunnel', lufs=LV['tunnel'])
+    bus.add(sfx_exit_flash(), b, 0, 0, 0.5, space='space', name='exit_flash', lufs=LV['exit'])
     # arrival
-    bus.add(sfx_arrive(), EV['arrive'][0] + 0.05, -6, 0, 0.45, space='space', name='arrive')
+    bus.add(sfx_arrive(), EV['arrive'][0] + 0.05, 0, 0, 0.45, space='space', name='arrive', lufs=LV['arrive'])
     # space ambience until the wipe
     t0, t1 = EV['space'][0], EV['strange_wipe'][1]
     sa = space_amb(t1 - t0)
     sa *= env_pts(tvec(len(sa)), [(0, 0), (1.5, 1), (t1 - t0 - 1.0, 1), (t1 - t0, 0)])[:, None]
-    bus.add(sa, t0, -20, 0, 0.35, space='space', name='space_amb')
+    bus.add(sa, t0, 0, 0, 0.35, space='space', name='space_amb', lufs=LV['space'])
     # black hole
     a, b = EV['blackhole']
-    bus.add(sfx_blackhole_form(), a, -5, 0, 0.4, space='space', name='blackhole_form')
+    bus.add(sfx_blackhole_form(), a, 0, 0, 0.4, space='space', name='blackhole_form', lufs=LV['bh_form'])
     t1 = EV['strange_wipe'][0] + 0.4
     T = t1 - (a + 0.9)
     bh = blackhole_bed(T)
     bh *= env_pts(tvec(len(bh)), [(0, 0), (0.8, 1), (EV['strange'][0] - a - 0.9, 1), (T - 0.4, 0.45), (T, 0)])[:, None]
-    bus.add(bh, a + 0.9, -13, 0, 0.3, space='space', name='blackhole_bed')
+    bus.add(bh, a + 0.9, 0, 0, 0.3, space='space', name='blackhole_bed', lufs=LV['bh_bed'])
     # Doctor Strange sling-ring
     a, b = EV['strange']
     pan_s = lambda tt: np.where(tt < 72.45, np.clip(panR(tt), -0.6, 0.6) * 0.8, np.clip(panR(tt), -0.6, 0.6) * 0.3)
-    bus.add(sfx_strange(EV['strange_wipe'][0] - a, pan_s, a, 1.6), a, -8, 0, 0.3, space='space', name='strange')
+    bus.add(sfx_strange(EV['strange_wipe'][0] - a, pan_s, a, 1.6), a, 0, 0, 0.3, space='space', name='strange',
+            lufs=LV['strange'])
     # wipe
     a, b = EV['strange_wipe']
-    bus.add(sfx_wipe(b - a), a, -5, 0, 0.3, space='space', name='strange_wipe')
+    bus.add(sfx_wipe(b - a), a, 0, 0, 0.3, space='space', name='strange_wipe', lufs=LV['wipe'])
     return bus
 
 
@@ -1565,8 +1606,15 @@ class Music:
         self.bus = np.zeros((N, 2))
         self.send = np.zeros((N, 2))
 
-    def put(self, x, t0, gain_db=0.0, rev=0.35, buf=None, fin=0.01, fout=0.05):
-        x = fade(np.asarray(x, np.float64), fin, fout) * undb(gain_db)
+    def put(self, x, t0, gain_db=0.0, rev=0.35, buf=None, fin=0.01, fout=0.05, lufs=None, peak=False):
+        """lufs: normalise integrated loudness of the element (or max momentary if peak=True)."""
+        x = np.asarray(x, np.float64)
+        if x.ndim == 1:
+            x = pan2(x, 0.0)
+        if lufs is not None:
+            ref = max_momentary(x) if peak else integrated(x if len(x) > ns(0.5) else np.pad(x, ((0, ns(0.5)), (0, 0))))
+            gain_db = gain_db + lufs - ref
+        x = fade(x, fin, fout) * undb(gain_db)
         i0 = int(round(t0 * SR))
         a0 = max(0, -i0)
         i0 = max(0, i0)
@@ -1584,6 +1632,12 @@ def chord_env(d, att, rel):
     return np.minimum(smooth01(t / att), smooth01((d - t) / rel))[:, None]
 
 
+# music loudness targets (integrated over each element, internal scale; peak=True -> max momentary)
+MV = dict(bath_pad=-33, bath_pluck=-34, studio=-32, suit=-38, ost=-33, strings=-33, hit=-28, ticks=-41,
+          calm=-34, drone=-41, portal1=-32, portal2=-31, tunnel=-29, space=-29, chime=-39, bh=-31,
+          strange=-30, final=-29, bell=-35)
+
+
 def build_music():
     M = Music()
     # ------------------------------------------------ A. bathroom: light / curious (0 .. 13.05)
@@ -1595,8 +1649,9 @@ def build_music():
         d = t1 - t0 + 1.2
         x = pad_tone(ch, d, 3000 + k, bright=2600, amp=1.0) * chord_env(d, 0.9 if k else 1.6, 1.2)
         x += pad_air([c[:-1] + str(int(c[-1]) + 1) for c in ch], d, 3100 + k, lp=6000, amp=0.5) * chord_env(d, 1.0, 1.2)
-        M.put(x, t0 - (0.0 if k == 0 else 0.6), -21, buf=bath)
+        M.put(x, t0 - (0.0 if k == 0 else 0.6), 0, buf=bath, lufs=MV['bath_pad'])
     # curious glass plucks, 8th grid at 92 bpm
+    plk = np.zeros((N, 2))
     e8 = 60 / 92 / 2
     pat = [0, None, 2, 1, None, 3, 2, None, 0, None, 3, None, 2, 1, None, None]
     r = rng(3200)
@@ -1609,10 +1664,11 @@ def build_music():
             nm = ch[(sel + (step // 16)) % len(ch)]
             f = hz(nm) * (4 if hz(nm) < 200 else 2)
             v = r.uniform(0.6, 1.0) * (0.75 if step % 2 else 1.0)
-            M.put(pluck(f, 1.8, 0.8, 3300 + step) * v, tt + r.normal(0, 0.006), -27 + 3 * smooth01(tt / 3), buf=bath,
-                  fin=0.0005, fout=0.2)
+            M.put(pan2(pluck(f, 1.8, 0.8, 3300 + step) * v, r.uniform(-0.35, 0.35)), tt + r.normal(0, 0.006),
+                  3 * smooth01(tt / 3), buf=plk, fin=0.0005, fout=0.2)
         tt += e8
         step += 1
+    M.put(plk, 0, 0, buf=bath, fin=0, fout=0, lufs=MV['bath_pluck'])
     bath = tape_stop(bath, EV['studio'][0], 0.55)
     M.bus += bath
     M.send += bath * 0.45
@@ -1624,16 +1680,15 @@ def build_music():
     x += pad_tone(['D2', 'A2', 'F3'], d, 3401, bright=600, amp=0.8) * chord_env(d, 2.5, 0.8)
     dr = sat(sine(hz('D1'), ns(d)) + 0.5 * sine(hz('D2'), ns(d)), 1.4)
     x += pan2(dr * 0.18, 0) * chord_env(d, 2.0, 0.8)
-    M.put(x, a, -20, rev=0.3)
+    M.put(x, a, 0, rev=0.3, lufs=MV['studio'])
     a, b = EV['suit']
     d = b - a + 2.2
     x = pad_air(['E5', 'A5', 'C6'], d, 3410, lp=9000, bw=0.003, amp=0.8) * chord_env(d, 1.2, 1.2)
-    M.put(x, a + 0.2, -27, rev=0.5)
+    M.put(x, a + 0.2, 0, rev=0.5, lufs=MV['suit'])
 
     # ------------------------------------------------ C. powers: tense / rising (19.7 .. 32.62)
     B = [0, 6, 13, 17, 22, 26]
-    Tm = [EV['anticipation'][0], EV['fire_on'], 26.56 if EV['ice_on'] == 26.56 else EV['ice_on'], EV['fusion'][0],
-          EV['release'], EV['finale_boom']]
+    Tm = [EV['anticipation'][0], EV['fire_on'], EV['ice_on'], EV['fusion'][0], EV['release'], EV['finale_boom']]
     btime = lambda b: np.interp(b, B, Tm)
     roots = lambda b: hz('D2') if b < 6 else hz('A#1') if b < 13 else hz('G1') if b < 17 else hz('A1') if b < 22 else hz('D2')
     off = [0, 0, 12, 0, 7, 0, 12, 0]
@@ -1653,11 +1708,17 @@ def build_music():
         bb = nb
         k += 1
     t0o, t1o = Tm[0], Tm[-1]
-    ost = spec(ost, lambda ff, tt: g_lp(ff, np.interp(tt, [0, t0o, Tm[1], Tm[3], t1o], [250, 250, 500, 1000, 2600]), 3),
+    i0, i1 = ns(t0o - 0.2), ns(t1o + 0.3)
+    seg = ost[i0:i1]
+    seg = spec(seg, lambda ff, tt: g_lp(ff, np.interp(tt + (t0o - 0.2), [t0o, Tm[1], Tm[3], t1o], [250, 500, 1000, 2600]), 3),
                2048, 512)
-    lvl = env_pts(tvec(N), [(t0o, 0), (t0o + 1.5, 0.35), (Tm[1], 0.55), (Tm[3], 0.8), (t1o - 0.12, 1.0), (t1o - 0.1, 0)])
-    M.bus += ost * lvl[:, None] * undb(-25)
-    M.send += ost * lvl[:, None] * undb(-25) * 0.2
+    lvl = env_pts(tvec(len(seg)) + (t0o - 0.2), [(t0o, 0), (t0o + 1.5, 0.35), (Tm[1], 0.55), (Tm[3], 0.8), (t1o - 0.12, 1.0),
+                                                (t1o - 0.1, 0)])
+    seg *= lvl[:, None]
+    seg *= undb(MV['ost'] - integrated(seg))
+    M.bus[i0:i1] += seg
+    M.send[i0:i1] += seg * 0.2
+    del ost, seg
     # sustained "string" chords
     sc = [(Tm[0], ['D3', 'F3', 'A3']), (Tm[1], ['A#2', 'F3', 'D4', 'C4']), (Tm[2], ['G2', 'D3', 'A#3', 'A4']),
           (Tm[3], ['A2', 'D3', 'E3', 'G3', 'E4']), (Tm[3] + 1.2, ['A2', 'C#3', 'E3', 'G3', 'C#4']),
@@ -1667,13 +1728,15 @@ def build_music():
         d = t1 - t0 + (0.6 if k + 1 < len(sc) else 0.0)
         x = pad_tone(ch, d, 3500 + k, bright=1200 + 350 * k, voices=3, harm=9, roll=1.1, amp=1.0)
         x *= chord_env(d, 0.6 if k else 2.0, 0.6 if k + 1 < len(sc) else 0.02)
-        M.put(x, t0 - (0.3 if k else 0), -24 + 1.4 * k, rev=0.3, fout=0.01)
-    # low cinematic hits on the section changes + 16th ticks in the fusion, roll into the boom
-    for t0, g in ((Tm[1], -13), (Tm[2], -14), (Tm[3], -13), (Tm[4], -12)):
+        M.put(x, t0 - (0.3 if k else 0), 1.0 * k, rev=0.3, fout=0.01, lufs=MV['strings'])
+    # low cinematic hits on the section changes
+    for t0, g in ((Tm[1], 0), (Tm[2], -1), (Tm[3], 0), (Tm[4], 1)):
         n = ns(1.5)
         tl = tvec(n)
         hit = sub_drop(1.5, 110, 48, 0.05, 0.35, 2.2) + butter(colored(n, int(t0 * 10), -1), 'low', 500, 2) * env_ar(tl, 0.002, 0.08) * 0.6
-        M.put(pan2(hit, 0), t0, g, rev=0.25, fin=0.0005)
+        M.put(pan2(hit, 0), t0, g, rev=0.25, fin=0.0005, lufs=MV['hit'], peak=True)
+    # 16th ticks in the fusion, rolling into the boom
+    tks = np.zeros((N, 2))
     bb = 17.0
     k = 0
     while bb < 25.92:
@@ -1681,27 +1744,28 @@ def build_music():
         n = ns(0.05)
         tk = butter(colored(n, 3600 + k, 0.0), 'high', 6000, 2) * np.exp(-tvec(n) / 0.008)
         acc = 1.0 if k % 4 == 0 else 0.55
-        g = -36 + 10 * smooth01((bb - 17) / 9)
-        M.put(pan2(tk * acc, 0.3 * np.sin(k)), tb, g, rev=0.15, fin=0.0003, fout=0.01)
+        g = -10 + 10 * smooth01((bb - 17) / 9)
+        M.put(pan2(tk * acc, 0.3 * np.sin(k)), tb, g, buf=tks, fin=0.0003, fout=0.01)
         bb += 0.25 if bb < 22 else 0.125
         k += 1
+    M.put(tks, 0, 0, rev=0.15, fin=0, fout=0, lufs=MV['ticks'])
 
     # ------------------------------------------------ D. calm after the boom (34.0 .. 43.6)
     sc = [(34.0, ['D3', 'A3', 'E4', 'F4'], 4.8), (38.4, ['A#2', 'F3', 'A3', 'D4'], 5.4)]
     for k, (t0, ch, d) in enumerate(sc):
         x = pad_tone(ch, d + 0.8, 3700 + k, bright=1100, amp=1.0) * chord_env(d + 0.8, 2.5 if k == 0 else 1.0, 1.0)
         x += pad_air(ch, d + 0.8, 3710 + k, lp=2500, amp=0.7) * chord_env(d + 0.8, 2.5 if k == 0 else 1.0, 1.0)
-        M.put(x, t0, -24, rev=0.4)
+        M.put(x, t0, 0, rev=0.4, lufs=MV['calm'])
     d = 43.6 - 34.6
     dr = sat(sine(hz('D1'), ns(d)), 1.3) * chord_env(d, 3.0, 1.0)[:, 0]
-    M.put(pan2(dr * 0.6, 0), 34.6, -28, rev=0.0)
+    M.put(pan2(dr * 0.6, 0), 34.6, 0, rev=0.0, lufs=MV['drone'])
 
     # ------------------------------------------------ E. portal: mystery -> wonder (43.4 .. 50.55)
     a = 43.4
     d = EV['ceil_portal'][0] - a + 0.6
     x = pad_air(['A#2', 'D3', 'G3', 'A3', 'D4'], d, 3800, lp=3000, amp=1.0) * chord_env(d, 1.5, 0.6)
     x += pad_tone(['A#2', 'D3', 'G3', 'A3'], d, 3801, bright=1500, amp=0.7) * chord_env(d, 1.5, 0.6)
-    M.put(x, a, -24, rev=0.45)
+    M.put(x, a, 0, rev=0.45, lufs=MV['portal1'])
     a = EV['ceil_portal'][0] - 0.1
     b = EV['ceil_portal_close'][0]
     d = b - a
@@ -1715,7 +1779,7 @@ def build_music():
     tl = tvec(ns(d))
     speed = 1 + 0.26 * smooth01((tl - ts) / (d - ts)) ** 1.5
     x = resample_speed(np.pad(x, ((0, ns(1.0)), (0, 0))), speed)
-    M.put(x, a, -22, rev=0.45, fout=0.03)
+    M.put(x, a, 0, rev=0.45, fout=0.03, lufs=MV['portal2'])
 
     # ------------------------------------------------ F. tunnel: Bb/D -> C/D -> D (51.0 .. 53.55)
     a, b = EV['tunnel']
@@ -1724,7 +1788,7 @@ def build_music():
         d = t1 - t0 + 0.25
         x = pad_tone(ch, d, 3900 + k, bright=2500, voices=4, harm=9, roll=1.0, amp=1.0)
         x *= chord_env(d, 0.35, 0.25) * np.interp(tvec(ns(d)), [0, d], [0.7, 1.0])[:, None]
-        M.put(x, t0, -21 + k, rev=0.35)
+        M.put(x, t0, 1.0 * k, rev=0.35, lufs=MV['tunnel'])
 
     # ------------------------------------------------ G. space: vast / awe (53.55 .. 62.2)
     sc = [(EV['space'][0], 57.6, ['D2', 'A2', 'F#3', 'E4', 'A4', 'C#5']),
@@ -1735,7 +1799,7 @@ def build_music():
         x = pad_air(ch, d, 4000 + k, lp=7000, amp=1.2) * chord_env(d, 1.8 if k == 0 else 1.0, 0.8)
         x += pad_tone(ch, d, 4010 + k, bright=2400, voices=4, amp=0.9) * chord_env(d, 1.5 if k == 0 else 1.0, 0.8)
         x += pad_air([c[:-1] + str(int(c[-1]) + 2) for c in ch[2:]], d, 4020 + k, lp=12000, bw=0.003, amp=0.35) * chord_env(d, 2.0, 0.8)
-        M.put(widen(x, 1.4), t0, -21, rev=0.6)
+        M.put(widen(x, 1.4), t0, 0, rev=0.6, lufs=MV['space'])
     # celestial chimes
     r = rng(4100)
     penta = ['D5', 'E5', 'F#5', 'A5', 'B5', 'D6', 'E6', 'F#6']
@@ -1744,7 +1808,7 @@ def build_music():
             continue
         nm = penta[int(r.integers(len(penta)))]
         b_ = bell(hz(nm), 3.0, ratio=r.choice([1.0, 2.0, 1.41]), index=r.uniform(0.6, 1.5), tau=1.1, tau_i=0.4, glass=0.15)
-        M.put(pan2(b_, r.uniform(-0.8, 0.8)), tt, -33 + r.uniform(-3, 2), rev=0.9, fin=0.001, fout=0.3)
+        M.put(pan2(b_, r.uniform(-0.8, 0.8)), tt, r.uniform(-3, 2), rev=0.9, fin=0.001, fout=0.3, lufs=MV['chime'], peak=True)
 
     # ------------------------------------------------ H. black hole: dread (62.0 .. 70.2)
     sc = [(EV['blackhole'][0], 65.6, ['D2', 'D#3', 'G3', 'A#3']), (65.4, 68.0, ['D2', 'G2', 'A#2', 'D3', 'G3']),
@@ -1753,10 +1817,10 @@ def build_music():
         d = t1 - t0 + 0.6
         x = pad_air(ch, d, 4200 + k, lp=2200 + 600 * k, amp=1.1) * chord_env(d, 1.2, 0.8)
         x += pad_tone(ch, d, 4210 + k, bright=900 + 300 * k, amp=0.9) * chord_env(d, 1.2, 0.8)
-        M.put(widen(x, 1.3), t0, -21, rev=0.55)
+        M.put(widen(x, 1.3), t0, 0, rev=0.55, lufs=MV['bh'])
     d = EV['strange'][0] + 0.5 - EV['blackhole'][0]
     dr = sat(sine(hz('D1'), ns(d)) + 0.4 * sine(hz('D#1') * 1.0, ns(d)) * 0.5, 1.4) * chord_env(d, 1.0, 0.6)[:, 0]
-    M.put(pan2(dr, 0), EV['blackhole'][0], -27, rev=0.2)
+    M.put(pan2(dr, 0), EV['blackhole'][0], 0, rev=0.2, lufs=MV['drone'] + 2)
 
     # ------------------------------------------------ I. Strange: mystic -> warm D major ending
     a = EV['strange'][0]
@@ -1767,15 +1831,16 @@ def build_music():
         x = pad_tone(ch, d, 4300 + k, bright=1600 + 900 * k, voices=3, harm=9, roll=1.2, amp=1.0)
         x += pad_air(ch, d, 4310 + k, lp=4000, amp=0.8)
         x *= chord_env(d, 0.8, 0.4) * np.interp(tvec(ns(d)), [0, d], [0.8, 1.1])[:, None]
-        M.put(x, t0, -22, rev=0.4)
+        M.put(x, t0, 1.0 * k, rev=0.4, lufs=MV['strange'])
     t0 = w0 + 0.15
     d = N / SR - t0
     ch = ['D2', 'A2', 'D3', 'F#3', 'A3', 'E4', 'F#4']
     x = pad_tone(ch, d, 4400, bright=1900, voices=4, amp=1.0) + pad_air(ch, d, 4401, lp=4500, amp=0.8)
     x *= np.minimum(smooth01(tvec(ns(d)) / 0.6), smooth01((d - tvec(ns(d))) / 0.9))[:, None]
-    M.put(widen(x, 1.3), t0, -20, rev=0.45)
+    M.put(widen(x, 1.3), t0, 0, rev=0.45, lufs=MV['final'])
     tb = EV['strange_wipe'][1] - 0.05
-    M.put(pan2(bell(hz('D6'), 1.5, 2.0, 1.0, 0.6, 0.2, glass=0.1), 0), tb, -28, rev=0.6, fin=0.001, fout=0.2)
+    M.put(pan2(bell(hz('D6'), 1.5, 2.0, 1.0, 0.6, 0.2, glass=0.1), 0), tb, 0, rev=0.6, fin=0.001, fout=0.2,
+          lufs=MV['bell'], peak=True)
     return M
 
 
@@ -1806,35 +1871,42 @@ def split3(x, f_lo=220.0, f_hi=5000.0):
 
 
 def duck(bg, voice, vad, depth, adapt=True, target=15.0, protect=None):
-    """3-band side-chain ducking. depth = (low, mid, high) dB at full voice activity."""
+    """3-band side-chain ducking. depth = (low, mid, high) dB at full voice activity.
+    protect: optional (3, n_frames) multipliers (0..1) of the reduction per band (hit windows)."""
     hop = 0.01
     vs = vad.astype(float)
-    # look-ahead 50 ms, attack 25 ms, release 350 ms
-    act = follow(maximum_filter1d(vs, 11, origin=-5), 0.025, 0.35, hop)
+    # look-ahead 140 ms, attack 50 ms, release 350 ms (smooth pre-duck, no pumping edges)
+    act = follow(maximum_filter1d(vs, 15, origin=-7), 0.05, 0.35, hop)
     red = np.zeros((len(act), 3))
     for b in range(3):
-        red[:, b] = depth[b] * act
-    bands = split3(bg)
+        red[:, b] = depth[b] * act * (1.0 if protect is None else protect[b])
+    bands = [b_.astype(np.float32) for b_ in split3(bg)]
     kv = kweight(voice)
     if adapt:
+        vmask = maximum_filter1d(vs, 15)                      # speech frames (+-70 ms)
+        tcv, lv = loud_curve(None, 0.2, hop, weighted=kv)
+        off = int(round(0.1 / hop))                           # curve frame j is centred at j*hop + 0.1 s
+        lvf = np.full(len(act), -70.0)
+        k = min(len(lv), len(act) - off)
+        lvf[off:off + k] = lv[:k]
+        ref = np.median(lvf[vs > 0])
+        lv_eff = np.maximum(lvf, ref - 12.0)                  # don't chase the decaying word tails
+        adapt_tot = np.zeros(len(act))
         for it in range(3):
             cur = sum(bands[b] * undb(-to_samples(red[:, b], 480))[:, None] for b in range(3))
-            tcv, lv = loud_curve(None, 0.2, hop, weighted=kv)
-            tcb, lb = loud_curve(None, 0.2, hop, weighted=kweight(cur))
-            need = np.zeros(len(act))
-            k = min(len(lv), len(need))
-            off = int(round((0.1) / hop))       # curve frame j is centred at j*hop + 0.1 s
-            need_c = np.clip(lb[:k] - (lv[:k] - target), 0, 14)
-            need[off:off + k] = need_c[:len(need) - off]
-            need *= act
-            need = maximum_filter1d(need, 9)
-            need = follow(need, 0.02, 0.3, hop)
-            if protect is not None:
-                need *= protect
-            red[:, 1] += need * 0.9
-            red[:, 2] += need * 0.7
-            red[:, 0] += need * 0.35
-    red[:, 0] = np.minimum(red[:, 0], 12)
+            _, lb = loud_curve(None, 0.2, hop, weighted=kweight(cur))
+            lbf = np.full(len(act), -70.0)
+            lbf[off:off + k] = lb[:k]
+            need = np.clip(lbf - (lv_eff - target), 0, 12) * vmask
+            need = np.minimum(need, 15 - adapt_tot)
+            need = maximum_filter1d(need, 15, origin=-5)
+            need = follow(need, 0.045, 0.28, hop)
+            adapt_tot += need
+            pr = np.ones((3, len(need))) if protect is None else protect
+            red[:, 1] += need * 0.9 * pr[1]
+            red[:, 2] += need * 0.7 * pr[2]
+            red[:, 0] += need * 0.6 * pr[0]
+    red[:, 0] = np.minimum(red[:, 0], 15)
     red[:, 1] = np.minimum(red[:, 1], 24)
     red[:, 2] = np.minimum(red[:, 2], 18)
     out = sum(bands[b] * undb(-to_samples(red[:, b], 480))[:, None] for b in range(3))
@@ -1842,11 +1914,8 @@ def duck(bg, voice, vad, depth, adapt=True, target=15.0, protect=None):
 
 
 def tp_limit(x, ceil_db=-1.2, look_ms=1.5, rel_ms=80.0):
-    up = ss.resample_poly(x, 4, 1, axis=0)
-    pk = np.abs(up).max(1)
     n = len(x)
-    pk = pk[:n * 4].reshape(n, 4).max(1)
-    pk = np.maximum(pk, np.abs(x).max(1))
+    pk = os_peak(x).astype(np.float64)
     g = np.minimum(1.0, undb(ceil_db) / (pk + 1e-12))
     L = ns(look_ms / 1000)
     g = minimum_filter1d(g, 2 * L + 1)
@@ -1877,13 +1946,21 @@ def write_wav(path, x, pcm16=False):
         wavfile.write(path, SR, x.astype(np.float32))
 
 
+def _mem():
+    try:
+        import resource
+        return f'{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f}MB'
+    except Exception:
+        return '?'
+
+
 def build(report=True):
     T0 = time.time()
     os.makedirs(STEMS, exist_ok=True)
     print('[sound] voice ...', flush=True)
     raw = load_voice()
     voice, vad, vinfo = process_voice(raw)
-    print(f'[sound]   voice processed ({time.time() - T0:.1f}s)', flush=True)
+    print(f'[sound]   voice processed ({time.time() - T0:.1f}s, peak {_mem()})', flush=True)
 
     print('[sound] sfx ...', flush=True)
     sb = build_sfx()
@@ -1893,13 +1970,13 @@ def build(report=True):
     for k, s in sb.send.items():
         if np.abs(s).max() > 0:
             sfx += convolve(s, irs[k]) * ret[k]
-    print(f'[sound]   sfx done ({time.time() - T0:.1f}s)', flush=True)
+    print(f'[sound]   sfx done ({time.time() - T0:.1f}s, peak {_mem()})', flush=True)
 
     print('[sound] music ...', flush=True)
     M = build_music()
     music = M.bus + convolve(M.send, irs['hall']) * 0.55
     music = butter(music, 'high', 35, 2)
-    print(f'[sound]   music done ({time.time() - T0:.1f}s)', flush=True)
+    print(f'[sound]   music done ({time.time() - T0:.1f}s, peak {_mem()})', flush=True)
 
     # gravitational warp of the background (music + space bed) as the black hole forms
     music = black_hole_warp(music)
@@ -1908,19 +1985,29 @@ def build(report=True):
     gm = env_pts(tvec(N), [(0, 1), (tb - 0.14, 1), (tb - 0.03, 0), (tb + 1.2, 0), (34.2, 1), (80, 1)])
     music *= gm[:, None]
 
-    # protection window: keep the boom's punch even though it lands on "finalização"
+    # hit protection: the magic moments land ON the words that call them ("fogo", "gelo", "portal",
+    # "finalização"); keep their punch for a few hundred ms - lows almost unducked, mids partly.
     tf = np.arange(int(N / 480) + 1) * 0.01
-    protect = 1 - 0.75 * env_pts(tf, [(0, 0), (tb - 0.05, 0), (tb, 1), (tb + 0.35, 1), (tb + 0.7, 0), (999, 0)])
+    w = np.zeros(len(tf))
+    for th, strength, pre, hold in ((EV['studio'][0], 0.3, 0.05, 0.3), (EV['fire_on'], 0.5, 0.05, 0.3),
+                                    (EV['ice_on'] + 0.2, 0.4, 0.25, 0.35), (EV['ceil_portal'][0], 0.4, 0.1, 0.35),
+                                    (EV['blackhole'][0], 0.25, 0.05, 0.3), (EV['strange'][0], 0.2, 0.05, 0.4)):
+        w = np.maximum(w, strength * env_pts(tf, [(0, 0), (th - pre - 0.08, 0), (th - pre, 1), (th + hold, 1),
+                                                  (th + hold + 0.35, 0), (999, 0)]))
+    # charge climax + boom on "finalização"
+    w = np.maximum(w, env_pts(tf, [(0, 0), (tb - 0.65, 0), (tb - 0.45, 0.5), (tb - 0.02, 0.6), (tb, 0.8), (tb + 0.35, 0.8),
+                                   (tb + 0.75, 0), (999, 0)]))
+    protect = np.stack([1 - np.minimum(1, w * 1.25), 1 - w, 1 - w * 0.9])
     vad_n = vad[:len(tf)] if len(vad) >= len(tf) else np.pad(vad, (0, len(tf) - len(vad)))
-    musd, mred = duck(music, voice, vad_n, (5.0, 11.0, 8.0), True, 18.0)
-    sfxd, sred = duck(sfx, voice, vad_n, (3.0, 8.0, 6.0), True, 15.0, protect)
+    musd, mred = duck(music, voice, vad_n, (5.0, 9.5, 7.0), True, 19.5)
+    sfxd, sred = duck(sfx, voice, vad_n, (4.0, 6.5, 5.0), True, 17.0, protect)
     bg = musd + sfxd
 
     mix = voice + bg
     # master: normalise to -14 LUFS, true-peak limit, iterate
     g = undb(-14.0 - integrated(mix))
     for it in range(4):
-        lim, gs = tp_limit(mix * g, -1.25)
+        lim, gs = tp_limit(mix * g, -1.5)
         li = integrated(lim)
         if abs(li + 14.0) < 0.1:
             break
@@ -1929,7 +2016,15 @@ def build(report=True):
     # fade the last 150 ms to digital silence (clean end)
     lim *= np.minimum(1, (N - 1 - np.arange(N)) / ns(0.15))[:, None]
     G = (g * gs)[:, None]
-    print(f'[sound] master: I={li:.2f} LUFS  TP={tp:.2f} dBTP  max GR={-db(gs.min()):.2f} dB  ({time.time() - T0:.1f}s)')
+    print(f'[sound] master: I={li:.2f} LUFS  TP={tp:.2f} dBTP  max GR={-db(gs.min()):.2f} dB  ({time.time() - T0:.1f}s, peak {_mem()})')
+    grf = -db(gs[:len(gs) // 480 * 480].reshape(-1, 480).min(1))
+    top = []
+    for j in np.argsort(-grf):
+        if grf[j] < 1.0 or len(top) >= 8:
+            break
+        if all(abs(j * 0.01 - q) > 0.4 for q, _ in top):
+            top.append((round(j * 0.01, 2), round(float(grf[j]), 1)))
+    print('[sound] limiter GR peaks (t, dB):', top)
 
     write_wav(os.path.join(AUDIO, 'mix.wav'), lim, pcm16=True)
     write_wav(os.path.join(AUDIO, 'sfx_only.wav'), bg * G, pcm16=True)
@@ -1937,13 +2032,15 @@ def build(report=True):
     write_wav(os.path.join(STEMS, 'sfx.wav'), sfxd * G)
     write_wav(os.path.join(STEMS, 'music.wav'), musd * G)
     info = dict(integrated_lufs=float(li), true_peak_dbtp=float(tp), limiter_max_gr_db=float(-db(gs.min())),
-                master_gain_db=float(db(g)), samples=int(N), duration=N / SR, voice=vinfo,
+                master_gain_db=float(db(g)), samples=int(N), duration=N / SR, voice=vinfo, limiter_peaks=top,
                 events=[dict(name=nm, t0=round(a, 3), t1=round(b, 3)) for nm, a, b in sb.log])
     if report:
-        info.update(make_report(voice * G, bg * G, lim, vad_n, sfxd * G, musd * G, mred, sred))
+        del sb, M, sfx, music, raw, irs, mix
+        info.update(make_report((voice * G).astype(np.float32), (bg * G).astype(np.float32), lim.astype(np.float32),
+                                vad_n))
     with open(os.path.join(AUDIO, 'mix_info.json'), 'w') as fh:
         json.dump(info, fh, indent=1)
-    print(f'[sound] done in {time.time() - T0:.1f}s')
+    print(f'[sound] done in {time.time() - T0:.1f}s (peak {_mem()})')
     return info
 
 
@@ -1961,7 +2058,7 @@ EV_MARKS = [
 ]
 
 
-def make_report(voice, bg, mix, vad, sfx, music, mred, sred):
+def make_report(voice, bg, mix, vad):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1978,7 +2075,14 @@ def make_report(voice, bg, mix, vad, sfx, music, mred, sred):
     sp = vf[:k] >= 0.7
     ratio = (lv[:k] - lb[:k])
     rs = ratio[sp]
+    vb = butter(voice.mean(1), 'band', [300, 5000], 4, zero_phase=True)
+    bb_ = butter(bg.mean(1), 'band', [300, 5000], 4, zero_phase=True)
+    _, lvb = loud_curve(vb, 0.4, hop)
+    _, lbb = loud_curve(bb_, 0.4, hop)
+    rsb = (lvb[:k] - lbb[:k])[sp]
     stats = dict(vbr_median_db=float(np.median(rs)), vbr_p10_db=float(np.percentile(rs, 10)),
+                 vbr_band300_5k_median_db=float(np.median(rsb)), vbr_band300_5k_p10_db=float(np.percentile(rsb, 10)),
+                 vbr_band300_5k_frac_ge12=float((rsb >= 12).mean()),
                  vbr_p05_db=float(np.percentile(rs, 5)), vbr_frac_ge12=float((rs >= 12).mean()),
                  bg_peak_momentary_lufs=float(lb.max()))
     # worst moments
@@ -1993,9 +2097,10 @@ def make_report(voice, bg, mix, vad, sfx, music, mred, sred):
     stats['vbr_worst_times'] = [round(w, 2) for w in worst]
     stats['vbr_worst_values'] = [round(float(ratio[:k][np.argmin(abs(tcv[:k] - w))]), 1) for w in worst]
 
-    def spectro(x, t0, t1, nfft=4096, hop_s=512):
+    def spectro(x, t0, t1, nfft=4096, hop_s=None):
         i0, i1 = ns(t0), ns(t1)
-        m = x[i0:i1].mean(1)
+        hop_s = hop_s or max(256, int((i1 - i0) / 2400))
+        m = x[i0:i1].mean(1).astype(np.float32)
         f, tt, Z = ss.stft(m, SR, nperseg=nfft, noverlap=nfft - hop_s)
         P = 20 * np.log10(np.abs(Z) + 1e-9)
         # log-frequency resample 30 Hz .. 20 kHz
@@ -2004,6 +2109,7 @@ def make_report(voice, bg, mix, vad, sfx, music, mred, sred):
         return tt + t0, fl, Pl
 
     paths = []
+    I_mix, TP_mix = integrated(mix), true_peak(mix)
     sections = [(0, C.DURATION, 'full'), (0, 20, 'a_0-20'), (19, 36, 'b_19-36'), (40, 56, 'c_40-56'),
                 (55, C.DURATION, 'd_55-end')]
     for t0, t1, tag in sections:
@@ -2063,7 +2169,7 @@ def make_report(voice, bg, mix, vad, sfx, music, mred, sred):
                 ax[0].text(te, 0.92, lab, color='#00e5ff', fontsize=9, rotation=0, va='top', ha='left')
         ax[4].set_xlim(t0, t1)
         ax[4].set_xlabel('time (s)', color='#ccc')
-        fig.suptitle(f'sound report [{tag}]  I={integrated(mix):.1f} LUFS  TP={true_peak(mix):.1f} dBTP  '
+        fig.suptitle(f'sound report [{tag}]  I={I_mix:.1f} LUFS  TP={TP_mix:.1f} dBTP  '
                      f'voice/bg in speech: median {stats["vbr_median_db"]:.1f} dB, p10 {stats["vbr_p10_db"]:.1f} dB, '
                      f'>=12dB {100 * stats["vbr_frac_ge12"]:.0f}%', color='#eee', fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.97))
